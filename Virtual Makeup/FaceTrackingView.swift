@@ -297,6 +297,7 @@ private struct LipMotionPose {
     let center: CGPoint
     let width: CGFloat
     let angle: CGFloat
+    let opening: CGFloat
 
     init?(contourPose: LipPose?) {
         guard let contourPose else {
@@ -305,6 +306,7 @@ private struct LipMotionPose {
         center = contourPose.center
         width = contourPose.width
         angle = contourPose.angle
+        opening = 0
     }
 
     init?(left: CGPoint, right: CGPoint, top: CGPoint, bottom: CGPoint) {
@@ -321,6 +323,7 @@ private struct LipMotionPose {
         )
         self.width = width
         angle = atan2(dy, dx)
+        opening = hypot(bottom.x - top.x, bottom.y - top.y) / max(width, 1)
     }
 
     init?(left: CGPoint, right: CGPoint, top: CGPoint, bottom: CGPoint, scaleBasis: CGFloat) {
@@ -336,6 +339,7 @@ private struct LipMotionPose {
         )
         width = scaleBasis
         angle = atan2(dy, dx)
+        opening = hypot(bottom.x - top.x, bottom.y - top.y) / max(scaleBasis, 1)
     }
 }
 
@@ -345,6 +349,24 @@ private struct FaceLocalMouthFrame {
     let downAxis: SIMD3<Float>
     let normalAxis: SIMD3<Float>
     let width: Float
+    let smileExpansion: Float
+    let openingRatio: Float
+    let referenceWidth: Float
+    let verticalAlignment: Float
+
+    func translated(by offset: SIMD3<Float>) -> FaceLocalMouthFrame {
+        FaceLocalMouthFrame(
+            center: center + offset,
+            xAxis: xAxis,
+            downAxis: downAxis,
+            normalAxis: normalAxis,
+            width: width,
+            smileExpansion: smileExpansion,
+            openingRatio: openingRatio,
+            referenceWidth: referenceWidth,
+            verticalAlignment: verticalAlignment
+        )
+    }
 }
 
 private enum CanonicalLipGeometry {
@@ -355,6 +377,10 @@ private enum CanonicalLipGeometry {
     static let innerLipIndices = [
         78, 95, 88, 178, 87, 14, 317, 402, 318, 324,
         308, 415, 310, 311, 312, 13, 82, 81, 80, 191
+    ]
+    static let upperDebugIndices = [
+        185, 40, 39, 37, 0, 267, 269, 270, 409,
+        408, 304, 303, 302, 11, 72, 73, 74, 184
     ]
     static let attentionLipIndices = [
         61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
@@ -379,6 +405,22 @@ private enum CanonicalLipGeometry {
 
     static func isOuterLipIndex(_ index: Int) -> Bool {
         outerLipIndexSet.contains(index)
+    }
+
+    static func upperLipSmileLiftFactor(for index: Int) -> Float {
+        if upperOuterLipIndexSet.contains(index) {
+            return 1.0
+        }
+        if upperSupportLipIndexSet.contains(index) {
+            return 0.82
+        }
+        if upperInnerSupportLipIndexSet.contains(index) {
+            return 0.72
+        }
+        if index == 13 || index == 12 || index == 11 {
+            return 0.68
+        }
+        return 0
     }
 
     static func meshExpansionScale(for index: Int) -> CGFloat {
@@ -730,14 +772,40 @@ fileprivate final class LipMeshRenderer {
     }
 
     private let lipNode = SCNNode()
+    private let debugRootNode = SCNNode()
+    private let debugOuterNode = SCNNode()
+    private let debugInnerNode = SCNNode()
+    private let debugUpperNode = SCNNode()
+    private let debugMeshNode = SCNNode()
+    private let debugFrameNode = SCNNode()
     private let lipMaterial = SCNMaterial()
+    private let debugOuterMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemGreen)
+    private let debugInnerMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemCyan)
+    private let debugUpperMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemRed)
+    private let debugMeshMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemYellow.withAlphaComponent(0.82))
+    private let debugFrameMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemPink)
     private var occlusionNode: SCNNode?
     private var lastTextureImage: UIImage?
+    private let debugLinesEnabled = false
+    private var lastCorrectionX: Float = 0
+    private var lastCorrectionY: Float = 0
 
     init() {
         lipNode.name = "lipstick.mesh"
         lipNode.isHidden = true
         lipNode.renderingOrder = 100
+        debugRootNode.name = "lipstick.debug"
+        debugRootNode.renderingOrder = 220
+        debugOuterNode.name = "lipstick.debug.outer"
+        debugInnerNode.name = "lipstick.debug.inner"
+        debugUpperNode.name = "lipstick.debug.upper"
+        debugMeshNode.name = "lipstick.debug.mesh"
+        debugFrameNode.name = "lipstick.debug.frame"
+        debugRootNode.addChildNode(debugMeshNode)
+        debugRootNode.addChildNode(debugOuterNode)
+        debugRootNode.addChildNode(debugInnerNode)
+        debugRootNode.addChildNode(debugUpperNode)
+        debugRootNode.addChildNode(debugFrameNode)
 
         lipMaterial.lightingModel = .constant
         lipMaterial.blendMode = .alpha
@@ -752,6 +820,10 @@ fileprivate final class LipMeshRenderer {
         if lipNode.parent !== faceNode {
             lipNode.removeFromParentNode()
             faceNode.addChildNode(lipNode)
+        }
+        if debugRootNode.parent !== faceNode {
+            debugRootNode.removeFromParentNode()
+            faceNode.addChildNode(debugRootNode)
         }
     }
 
@@ -779,8 +851,25 @@ fileprivate final class LipMeshRenderer {
         (occlusionNode?.geometry as? ARSCNFaceGeometry)?.update(from: faceAnchor.geometry)
     }
 
-    func render(contour: LipContour, texture: LipTexture, mouthFrame: FaceLocalMouthFrame) {
-        guard let geometry = makeGeometry(contour: contour, texture: texture, mouthFrame: mouthFrame) else {
+    func render(contour: LipContour,
+                texture: LipTexture,
+                mouthFrame: FaceLocalMouthFrame,
+                renderer: SCNSceneRenderer,
+                faceNode: SCNNode,
+                contourAge: CFTimeInterval,
+                motionDelta: CGFloat) {
+        let correctedMouthFrame = mouthFrame.translated(
+            by: projectionAlignmentCorrection(
+                contour: contour,
+                mouthFrame: mouthFrame,
+                renderer: renderer,
+                faceNode: faceNode,
+                contourAge: contourAge,
+                motionDelta: motionDelta
+            )
+        )
+
+        guard let geometry = makeGeometry(contour: contour, texture: texture, mouthFrame: correctedMouthFrame) else {
             clearLip()
             return
         }
@@ -792,17 +881,40 @@ fileprivate final class LipMeshRenderer {
         geometry.materials = [lipMaterial]
         lipNode.geometry = geometry
         lipNode.isHidden = false
+        if debugLinesEnabled {
+            updateDebugLines(contour: contour, mouthFrame: correctedMouthFrame)
+            logProjectionDiagnostics(
+                contour: contour,
+                mouthFrame: correctedMouthFrame,
+                renderer: renderer,
+                faceNode: faceNode
+            )
+        } else {
+            clearDebugLines()
+        }
     }
 
     func clearLip() {
         lipNode.geometry = nil
         lipNode.isHidden = true
+        clearDebugLines()
     }
 
     func clearAll() {
         clearLip()
         lastTextureImage = nil
         lipMaterial.diffuse.contents = nil
+    }
+
+    private static func makeDebugMaterial(color: UIColor) -> SCNMaterial {
+        let material = SCNMaterial()
+        material.diffuse.contents = color
+        material.emission.contents = color
+        material.lightingModel = .constant
+        material.isDoubleSided = true
+        material.readsFromDepthBuffer = false
+        material.writesToDepthBuffer = false
+        return material
     }
 
     private func makeGeometry(contour: LipContour,
@@ -869,6 +981,350 @@ fileprivate final class LipMeshRenderer {
             bytesPerIndex: MemoryLayout<Int32>.size
         )
         return SCNGeometry(sources: [vertexSource, textureSource], elements: [element])
+    }
+
+    private func updateDebugLines(contour: LipContour, mouthFrame: FaceLocalMouthFrame) {
+        guard debugLinesEnabled,
+              let pose = contour.pose else {
+            clearDebugLines()
+            return
+        }
+
+        let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
+        let sceneVertices = mesh.vertices.map {
+            scenePoint(for: $0, pose: pose, contour: contour, mouthFrame: mouthFrame)
+        }
+        var pointByIndex: [Int: SCNVector3] = [:]
+        pointByIndex.reserveCapacity(mesh.vertices.count)
+        for (offset, vertex) in mesh.vertices.enumerated() {
+            guard sceneVertices.indices.contains(offset) else {
+                continue
+            }
+            pointByIndex[vertex.index] = sceneVertices[offset]
+        }
+
+        debugOuterNode.geometry = lineLoopGeometry(
+            indices: CanonicalLipGeometry.outerLipIndices,
+            pointByIndex: pointByIndex,
+            material: debugOuterMaterial
+        )
+        debugInnerNode.geometry = lineLoopGeometry(
+            indices: CanonicalLipGeometry.innerLipIndices,
+            pointByIndex: pointByIndex,
+            material: debugInnerMaterial
+        )
+        debugUpperNode.geometry = lineStripGeometry(
+            indices: CanonicalLipGeometry.upperDebugIndices,
+            pointByIndex: pointByIndex,
+            offset: mouthFrame.normalAxis * mouthFrame.width * 0.018,
+            material: debugUpperMaterial
+        )
+        debugMeshNode.geometry = meshWireGeometry(
+            vertices: sceneVertices,
+            triangleIndices: mesh.indices,
+            material: debugMeshMaterial
+        )
+        debugFrameNode.geometry = mouthFrameGeometry(
+            mouthFrame,
+            material: debugFrameMaterial
+        )
+        debugRootNode.isHidden = false
+    }
+
+    private func clearDebugLines() {
+        debugOuterNode.geometry = nil
+        debugInnerNode.geometry = nil
+        debugUpperNode.geometry = nil
+        debugMeshNode.geometry = nil
+        debugFrameNode.geometry = nil
+        debugRootNode.isHidden = true
+    }
+
+    private func lineLoopGeometry(indices: [Int],
+                                  pointByIndex: [Int: SCNVector3],
+                                  material: SCNMaterial) -> SCNGeometry? {
+        let points = indices.compactMap { pointByIndex[$0] }
+        guard points.count >= 2 else {
+            return nil
+        }
+
+        var lineIndices = [Int32]()
+        lineIndices.reserveCapacity(points.count * 2)
+        for index in points.indices {
+            lineIndices.append(Int32(index))
+            lineIndices.append(Int32((index + 1) % points.count))
+        }
+
+        return lineGeometry(vertices: points, indices: lineIndices, material: material)
+    }
+
+    private func lineStripGeometry(indices: [Int],
+                                   pointByIndex: [Int: SCNVector3],
+                                   offset: SIMD3<Float>,
+                                   material: SCNMaterial) -> SCNGeometry? {
+        let points = indices.compactMap { index -> SCNVector3? in
+            guard let point = pointByIndex[index] else {
+                return nil
+            }
+            return SCNVector3(point.x + offset.x, point.y + offset.y, point.z + offset.z)
+        }
+        guard points.count >= 2 else {
+            return nil
+        }
+
+        var lineIndices = [Int32]()
+        lineIndices.reserveCapacity((points.count - 1) * 2)
+        for index in 0..<(points.count - 1) {
+            lineIndices.append(Int32(index))
+            lineIndices.append(Int32(index + 1))
+        }
+
+        return lineGeometry(vertices: points, indices: lineIndices, material: material)
+    }
+
+    private func meshWireGeometry(vertices: [SCNVector3],
+                                  triangleIndices: [Int32],
+                                  material: SCNMaterial) -> SCNGeometry? {
+        guard vertices.count >= 3, triangleIndices.count >= 3 else {
+            return nil
+        }
+
+        var lineIndices = [Int32]()
+        lineIndices.reserveCapacity(triangleIndices.count * 2)
+        for offset in stride(from: 0, to: triangleIndices.count - 2, by: 3) {
+            let first = triangleIndices[offset]
+            let second = triangleIndices[offset + 1]
+            let third = triangleIndices[offset + 2]
+            lineIndices.append(contentsOf: [first, second, second, third, third, first])
+        }
+
+        return lineGeometry(vertices: vertices, indices: lineIndices, material: material)
+    }
+
+    private func mouthFrameGeometry(_ mouthFrame: FaceLocalMouthFrame,
+                                    material: SCNMaterial) -> SCNGeometry? {
+        let center = SCNVector3(mouthFrame.center.x, mouthFrame.center.y, mouthFrame.center.z)
+        let right = mouthFrame.center + mouthFrame.xAxis * mouthFrame.width * 0.42
+        let down = mouthFrame.center + mouthFrame.downAxis * mouthFrame.width * 0.30
+        let normal = mouthFrame.center + mouthFrame.normalAxis * mouthFrame.width * 0.30
+        let vertices = [
+            center,
+            SCNVector3(right.x, right.y, right.z),
+            center,
+            SCNVector3(down.x, down.y, down.z),
+            center,
+            SCNVector3(normal.x, normal.y, normal.z)
+        ]
+        return lineGeometry(
+            vertices: vertices,
+            indices: [0, 1, 2, 3, 4, 5],
+            material: material
+        )
+    }
+
+    private func lineGeometry(vertices: [SCNVector3],
+                              indices: [Int32],
+                              material: SCNMaterial) -> SCNGeometry? {
+        guard vertices.count >= 2, indices.count >= 2 else {
+            return nil
+        }
+
+        let source = SCNGeometrySource(vertices: vertices)
+        let element = SCNGeometryElement(indices: indices, primitiveType: .line)
+        let geometry = SCNGeometry(sources: [source], elements: [element])
+        geometry.materials = [material]
+        return geometry
+    }
+
+    private func projectionAlignmentCorrection(contour: LipContour,
+                                               mouthFrame: FaceLocalMouthFrame,
+                                               renderer: SCNSceneRenderer,
+                                               faceNode: SCNNode,
+                                               contourAge: CFTimeInterval,
+                                               motionDelta: CGFloat) -> SIMD3<Float> {
+        guard contourAge < 0.055,
+              motionDelta < 0.032 else {
+            return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
+        }
+
+        guard let pose = contour.pose else {
+            return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
+        }
+
+        let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
+        guard !mesh.vertices.isEmpty else {
+            return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
+        }
+
+        var sumX: CGFloat = 0
+        var sumY: CGFloat = 0
+        var count: CGFloat = 0
+
+        for vertex in mesh.vertices {
+            let local = scenePoint(for: vertex, pose: pose, contour: contour, mouthFrame: mouthFrame)
+            let world = faceNode.convertPosition(local, to: nil)
+            let projected = renderer.projectPoint(world)
+            let screen = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            guard screen.x.isFinite,
+                  screen.y.isFinite,
+                  projected.z.isFinite else {
+                continue
+            }
+
+            sumX += screen.x - vertex.screen.x
+            sumY += screen.y - vertex.screen.y
+            count += 1
+        }
+
+        guard count > 0 else {
+            return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
+        }
+
+        let avgX = sumX / count
+        let avgY = sumY / count
+        let localUnitsPerPixel = mouthFrame.width / Float(max(pose.width, 1))
+        let maxAxisCorrection = mouthFrame.width * 0.16
+        let correctionGain: Float = 0.82
+        let correctionX = Self.clamped(
+            -Float(avgX) * localUnitsPerPixel * correctionGain,
+            minValue: -maxAxisCorrection,
+            maxValue: maxAxisCorrection
+        )
+        let correctionY = Self.clamped(
+            -Float(avgY) * localUnitsPerPixel * correctionGain,
+            minValue: -maxAxisCorrection,
+            maxValue: maxAxisCorrection
+        )
+        lastCorrectionX = lastCorrectionX * 0.38 + correctionX * 0.62
+        lastCorrectionY = lastCorrectionY * 0.38 + correctionY * 0.62
+
+        LipDebugLog.throttled(
+            "lip_projection_correction",
+            interval: 0.22,
+            "lip_projection correction age:\(Self.fmt(CGFloat(contourAge))) motion:\(Self.fmt(motionDelta)) avgX:\(Self.fmt(avgX)) avgY:\(Self.fmt(avgY)) localPerPx:\(String(format: "%.6f", Double(localUnitsPerPixel))) corrX:\(String(format: "%.5f", Double(lastCorrectionX))) corrY:\(String(format: "%.5f", Double(lastCorrectionY)))"
+        )
+
+        return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
+    }
+
+    private func logProjectionDiagnostics(contour: LipContour,
+                                          mouthFrame: FaceLocalMouthFrame,
+                                          renderer: SCNSceneRenderer,
+                                          faceNode: SCNNode) {
+        guard let pose = contour.pose else {
+            return
+        }
+
+        let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
+        guard !mesh.vertices.isEmpty else {
+            return
+        }
+
+        var deltasByIndex: [Int: CGPoint] = [:]
+        deltasByIndex.reserveCapacity(mesh.vertices.count)
+        var allProjected = [CGPoint]()
+        allProjected.reserveCapacity(mesh.vertices.count)
+
+        for vertex in mesh.vertices {
+            let local = scenePoint(for: vertex, pose: pose, contour: contour, mouthFrame: mouthFrame)
+            let world = faceNode.convertPosition(local, to: nil)
+            let projected = renderer.projectPoint(world)
+            let screen = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            guard screen.x.isFinite, screen.y.isFinite, projected.z.isFinite else {
+                continue
+            }
+
+            deltasByIndex[vertex.index] = CGPoint(
+                x: screen.x - vertex.screen.x,
+                y: screen.y - vertex.screen.y
+            )
+            allProjected.append(screen)
+        }
+
+        guard !deltasByIndex.isEmpty else {
+            return
+        }
+
+        let upper = Self.deltaStats(
+            for: CanonicalLipGeometry.upperDebugIndices,
+            in: deltasByIndex
+        )
+        let lower = Self.deltaStats(
+            for: [146, 91, 181, 84, 17, 314, 405, 321, 375],
+            in: deltasByIndex
+        )
+        let inner = Self.deltaStats(
+            for: CanonicalLipGeometry.innerLipIndices,
+            in: deltasByIndex
+        )
+        let bounds = boundsText(contour.bounds)
+        let projectedBounds = Self.bounds(for: allProjected)
+        let projectedBoundsText = boundsText(projectedBounds)
+
+        LipDebugLog.throttled(
+            "lip_projection_diagnostics",
+            interval: 0.22,
+            "lip_projection deltaPx upper(avgX:\(Self.fmt(upper.avgX)) avgY:\(Self.fmt(upper.avgY)) max:\(Self.fmt(upper.maxDistance)) n:\(upper.count)) lower(avgX:\(Self.fmt(lower.avgX)) avgY:\(Self.fmt(lower.avgY)) max:\(Self.fmt(lower.maxDistance)) n:\(lower.count)) inner(avgX:\(Self.fmt(inner.avgX)) avgY:\(Self.fmt(inner.avgY)) max:\(Self.fmt(inner.maxDistance)) n:\(inner.count)) mouth(width:\(Self.fmt(CGFloat(mouthFrame.width))) ref:\(Self.fmt(CGFloat(mouthFrame.referenceWidth))) open:\(Self.fmt(CGFloat(mouthFrame.openingRatio))) smile:\(Self.fmt(CGFloat(mouthFrame.smileExpansion))) valign:\(Self.fmt(CGFloat(mouthFrame.verticalAlignment))) contour:\(bounds) projected:\(projectedBoundsText)"
+        )
+    }
+
+    private static func deltaStats(for indices: [Int],
+                                   in deltasByIndex: [Int: CGPoint]) -> (avgX: CGFloat, avgY: CGFloat, maxDistance: CGFloat, count: Int) {
+        var sumX: CGFloat = 0
+        var sumY: CGFloat = 0
+        var maxDistance: CGFloat = 0
+        var count = 0
+
+        for index in indices {
+            guard let delta = deltasByIndex[index] else {
+                continue
+            }
+            sumX += delta.x
+            sumY += delta.y
+            maxDistance = max(maxDistance, hypot(delta.x, delta.y))
+            count += 1
+        }
+
+        guard count > 0 else {
+            return (0, 0, 0, 0)
+        }
+        return (sumX / CGFloat(count), sumY / CGFloat(count), maxDistance, count)
+    }
+
+    private static func bounds(for points: [CGPoint]) -> CGRect? {
+        guard let first = points.first else {
+            return nil
+        }
+
+        var minX = first.x
+        var maxX = first.x
+        var minY = first.y
+        var maxY = first.y
+
+        for point in points.dropFirst() {
+            minX = min(minX, point.x)
+            maxX = max(maxX, point.x)
+            minY = min(minY, point.y)
+            maxY = max(maxY, point.y)
+        }
+
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    private func boundsText(_ bounds: CGRect?) -> String {
+        guard let bounds else {
+            return "nil"
+        }
+
+        return "x:\(Self.fmt(bounds.minX)) y:\(Self.fmt(bounds.minY)) w:\(Self.fmt(bounds.width)) h:\(Self.fmt(bounds.height))"
+    }
+
+    private static func fmt(_ value: CGFloat) -> String {
+        String(format: "%.2f", Double(value))
+    }
+
+    private static func clamped(_ value: Float, minValue: Float, maxValue: Float) -> Float {
+        min(max(value, minValue), maxValue)
     }
 
     private func makeCanonicalLipMesh(contour: LipContour, pose: LipPose) -> (vertices: [MeshVertex], indices: [Int32]) {
@@ -1023,10 +1479,13 @@ fileprivate final class LipMeshRenderer {
         let depthOffset = surfaceOffset -
             depthDelta * mouthFrame.width * 0.45 * geometryScale -
             canonicalDepthDelta * mouthFrame.width * 0.22
+        let smileLift = CanonicalLipGeometry.upperLipSmileLiftFactor(for: vertex.index) *
+            min(max(mouthFrame.smileExpansion, 0), 1) *
+            mouthFrame.width * 0.016
 
         let local = mouthFrame.center +
             mouthFrame.xAxis * (normalizedX * mouthFrame.width) +
-            mouthFrame.downAxis * (normalizedY * mouthFrame.width) +
+            mouthFrame.downAxis * (normalizedY * mouthFrame.width - smileLift) +
             mouthFrame.normalAxis * depthOffset
 
         return SCNVector3(local.x, local.y, local.z)
@@ -1196,10 +1655,12 @@ private final class LipTextureRenderer {
             }
 
             let outerAlpha = Self.smoothStep(edge0: 0.004, edge1: 0.12, value: edgeDistances.outer)
-            let innerAlpha = Self.smoothStep(edge0: 0.0005, edge1: 0.035, value: edgeDistances.inner)
+            let innerEdgeAlpha = Self.smoothStep(edge0: 0.0005, edge1: 0.022, value: edgeDistances.inner)
             let lowerRegion = edgeDistances.uv.y > 0.30
-            let edgeFloor: CGFloat = lowerRegion ? 0.50 : 0.28
+            let edgeFloor: CGFloat = lowerRegion ? 0.62 : 0.46
+            let innerFloor: CGFloat = lowerRegion ? 0.74 : 0.64
             let regionBoost: CGFloat = lowerRegion ? 1.24 : 1.12
+            let innerAlpha = innerFloor + innerEdgeAlpha * (1 - innerFloor)
             let alpha = min((edgeFloor + outerAlpha * (1 - edgeFloor)) * innerAlpha * regionBoost, 1)
             return CanonicalAlphaSample(alpha: Float(alpha))
         }
@@ -1404,20 +1865,21 @@ private final class LipTextureRenderer {
                 alphaPixels += 1
 
                 let imagePoint = sample.point.applying(inverseImageTransform)
-                guard Self.samplePixel(
+                if Self.samplePixel(
                     at: imagePoint,
                     baseAddress: baseAddress,
                     bytesPerRow: bytesPerRow,
                     width: sourceWidth,
                     height: sourceHeight
-                ) != nil else {
+                ) != nil {
+                    sampledPixels += 1
+                } else {
                     outOfImagePixels += 1
-                    continue
                 }
-                sampledPixels += 1
 
                 let edgeNoise = Self.edgeNoise(maskAlpha: sample.alpha, x: x, y: y, frame: .zero)
-                let alpha = min(sample.alpha * 0.82 * edgeNoise, 0.72)
+                let coverageAlpha = max(sample.alpha, lowLatency ? 0.74 : 0.66)
+                let alpha = min(coverageAlpha * 0.90 * edgeNoise, lowLatency ? 0.88 : 0.84)
                 let lipRGB = color
                 let offset = (y * pixelWidth + x) * 4
                 rgba[offset] = Self.uint8(lipRGB.red * alpha)
@@ -1489,7 +1951,8 @@ private final class LipTextureRenderer {
                 }
 
                 let edgeNoise = edgeNoise(maskAlpha: sample.alpha, x: x, y: y, frame: .zero)
-                let alpha = min(sample.alpha * 0.82 * edgeNoise, 0.84)
+                let coverageAlpha = max(sample.alpha, 0.68)
+                let alpha = min(coverageAlpha * 0.90 * edgeNoise, 0.86)
                 let offset = (y * pixelWidth + x) * 4
                 rgba[offset] = uint8(color.red * alpha)
                 rgba[offset + 1] = uint8(color.green * alpha)
@@ -1897,8 +2360,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private var lastDisplayedLipTextureTime: CFTimeInterval?
     private var lastAcceptedMotionPose: LipMotionPose?
     private var latestMeshContour: LipContour?
+    private var latestMeshContourTime: CFTimeInterval?
+    private var latestMeshMotionPose: LipMotionPose?
     private var latestLipTexture: LipTexture?
     private var lastLoggedMediaPipeLandmarkCount: Int?
+    private var neutralMouthWidth: Float?
 
     private static let outerLipIndices = CanonicalLipGeometry.outerLipIndices
     private static let innerLipIndices = CanonicalLipGeometry.innerLipIndices
@@ -1910,7 +2376,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private static let maxMotionCompensationAge: CFTimeInterval = 0.16
     private static let maxDisplayedTextureTrackingAge: CFTimeInterval = 0.36
     private static let maxPendingLiveFrameAge: CFTimeInterval = 0.8
-    private static let minTextureRenderInterval: CFTimeInterval = 0.09
+    private static let minTextureRenderInterval: CFTimeInterval = 0.045
+    private static let lipMeshVerticalAlignmentOffset: Float = 0.045
+    private static let maxLipMeshVerticalAlignment: Float = 0.0022
 
     init(isFaceDetected: Binding<Bool>) {
         _isFaceDetected = isFaceDetected
@@ -1982,10 +2450,14 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             if let mouthFrame,
                let meshState {
                 lipMeshRenderer.render(
-                    contour: meshState.contour,
-                    texture: meshState.texture,
-                    mouthFrame: mouthFrame
-                )
+                contour: meshState.contour,
+                texture: meshState.texture,
+                mouthFrame: mouthFrame,
+                renderer: renderer,
+                faceNode: node,
+                contourAge: meshState.contourAge,
+                motionDelta: meshState.motionDelta
+            )
             } else {
                 let availability = currentLipMeshAvailability()
                 LipDebugLog.throttled(
@@ -2109,6 +2581,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private struct LipMeshState {
         let contour: LipContour
         let texture: LipTexture
+        let contourAge: CFTimeInterval
+        let motionDelta: CGFloat
     }
 
     private func submitLiveStreamFrame(pixelBuffer: CVPixelBuffer,
@@ -2267,7 +2741,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         smoothedLipContour = stableContour
         smoothedLipPose = stableContour.pose
         lastAcceptedMotionPose = motionReference
-        setLatestMeshContour(stableContour)
+        setLatestMeshContour(stableContour, motionReference: motionReference)
         markLipShapeAccepted()
         LipDebugLog.throttled(
             "lip_detection_accept",
@@ -2499,6 +2973,24 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             width: pose.width * scale,
             angle: pose.angle + rotation
         )
+    }
+
+    private func motionDelta(from source: LipMotionPose?, to target: LipMotionPose?) -> CGFloat {
+        guard let source, let target else {
+            return .greatestFiniteMagnitude
+        }
+
+        let centerDelta = hypot(
+            target.center.x - source.center.x,
+            target.center.y - source.center.y
+        ) / max(source.width, 1)
+        let scaleDelta = abs(target.width / max(source.width, 1) - 1)
+        let angleDelta = abs(Self.normalizedAngle(target.angle - source.angle))
+        let openingDelta = abs(target.opening - source.opening)
+        return centerDelta +
+            scaleDelta * 0.65 +
+            angleDelta * 0.35 +
+            openingDelta * 1.45
     }
 
     private static func normalizedAngle(_ angle: CGFloat) -> CGFloat {
@@ -2879,9 +3371,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let heightChange = abs(currentBounds.height / previousBounds.height - 1)
         let openingChange = abs(mouthOpeningRatio(current) - mouthOpeningRatio(previous))
 
-        return widthChange > 0.11 ||
-            heightChange > 0.15 ||
-            openingChange > 0.035
+        return widthChange > 0.065 ||
+            heightChange > 0.090 ||
+            openingChange > 0.020
     }
 
     private func mouthOpeningRatio(_ contour: LipContour) -> CGFloat {
@@ -2907,7 +3399,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let scaleMotion = abs(currentPose.width - previousPose.width) / max(previousPose.width, 1)
         let angleMotion = abs(currentPose.angle - previousPose.angle)
         let motion = centerMotion * 1.6 + scaleMotion + angleMotion * 0.8
-        return min(max(0.90 + motion * 1.4, 0.90), 0.98)
+        return min(max(0.94 + motion * 1.6, 0.94), 0.99)
     }
 
     private func smooth(previous: CGPoint, current: CGPoint, alpha: CGFloat) -> CGPoint {
@@ -2966,6 +3458,16 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         guard width.isFinite, width > 0.008 else {
             return nil
         }
+        let openingRatio = simd_length(bottom - top) / max(width, 0.0001)
+        if openingRatio < 0.34 {
+            if let previousNeutral = neutralMouthWidth {
+                neutralMouthWidth = min(previousNeutral * 0.96 + width * 0.04, width)
+            } else {
+                neutralMouthWidth = width
+            }
+        }
+        let referenceWidth = neutralMouthWidth.map { min(max($0, width * 0.72), width) } ?? width
+        let smileExpansion = max(0, min(width / max(referenceWidth, 0.0001) - 1, 1.2))
 
         let xAxis = simd_normalize(widthVector)
         var downVector = SIMD3<Float>(0, -1, 0)
@@ -2984,7 +3486,12 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             normalAxis = -normalAxis
         }
 
-        let center = (left + right + top + bottom) * 0.25
+        let verticalAlignment = min(
+            referenceWidth * Self.lipMeshVerticalAlignmentOffset,
+            Self.maxLipMeshVerticalAlignment
+        )
+        let center = (left + right + top + bottom) * 0.25 +
+            downAxis * verticalAlignment
         guard center.x.isFinite,
               center.y.isFinite,
               center.z.isFinite else {
@@ -2996,7 +3503,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             xAxis: xAxis,
             downAxis: downAxis,
             normalAxis: normalAxis,
-            width: width
+            width: width,
+            smileExpansion: smileExpansion,
+            openingRatio: openingRatio,
+            referenceWidth: referenceWidth,
+            verticalAlignment: verticalAlignment
         )
     }
 
@@ -3184,9 +3695,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         return pose
     }
 
-    private func setLatestMeshContour(_ contour: LipContour) {
+    private func setLatestMeshContour(_ contour: LipContour, motionReference: LipMotionPose) {
         meshStateLock.lock()
         latestMeshContour = contour
+        latestMeshContourTime = CACurrentMediaTime()
+        latestMeshMotionPose = motionReference
         meshStateLock.unlock()
     }
 
@@ -3199,13 +3712,21 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private func currentLipMeshState() -> LipMeshState? {
         meshStateLock.lock()
         let contour = latestMeshContour
+        let contourTime = latestMeshContourTime
+        let contourMotionPose = latestMeshMotionPose
         let texture = latestLipTexture
+        let currentMotionPose = latestLipMotionPose
         meshStateLock.unlock()
 
         guard let contour, let texture else {
             return nil
         }
-        return LipMeshState(contour: contour, texture: texture)
+        return LipMeshState(
+            contour: contour,
+            texture: texture,
+            contourAge: contourTime.map { CACurrentMediaTime() - $0 } ?? .greatestFiniteMagnitude,
+            motionDelta: motionDelta(from: contourMotionPose, to: currentMotionPose)
+        )
     }
 
     private func currentLipMeshAvailability() -> (contour: Bool, texture: Bool) {
@@ -3219,6 +3740,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private func clearLipMeshState() {
         meshStateLock.lock()
         latestMeshContour = nil
+        latestMeshContourTime = nil
+        latestMeshMotionPose = nil
         latestLipTexture = nil
         meshStateLock.unlock()
     }
@@ -3230,6 +3753,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         pendingLiveFrames.removeAll()
         lastTextureSubmitTime = nil
         lastAcceptedMotionPose = nil
+        neutralMouthWidth = nil
         clearLipShapeFreshness()
         setLatestLipMotionPose(nil)
         clearLipMeshState()
