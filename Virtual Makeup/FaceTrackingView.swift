@@ -14,7 +14,7 @@ private enum LipDebugLog {
     static func throttled(_ key: String,
                           interval: CFTimeInterval = 0.5,
                           _ message: @autoclosure () -> String) {
-        #if DEBUG
+
         let now = CACurrentMediaTime()
         lock.lock()
         if let last = lastLoggedAt[key], now - last < interval {
@@ -24,7 +24,52 @@ private enum LipDebugLog {
         lastLoggedAt[key] = now
         lock.unlock()
         print(message())
-        #endif
+
+    }
+}
+
+private final class FPSMeter {
+    private let name: String
+    private let lock = NSLock()
+    private var frameCount = 0
+    private var lastReportTime = CACurrentMediaTime()
+    private var accumulatedMilliseconds: Double = 0
+    private var measuredSamples = 0
+
+    init(_ name: String) {
+        self.name = name
+    }
+
+    func tick(workMilliseconds: Double? = nil) {
+
+        let now = CACurrentMediaTime()
+        lock.lock()
+        frameCount += 1
+        if let workMilliseconds {
+            accumulatedMilliseconds += workMilliseconds
+            measuredSamples += 1
+        }
+
+        let elapsed = now - lastReportTime
+        guard elapsed >= 1 else {
+            lock.unlock()
+            return
+        }
+
+        let fps = Double(frameCount) / elapsed
+        let averageMilliseconds = measuredSamples > 0 ? accumulatedMilliseconds / Double(measuredSamples) : nil
+        frameCount = 0
+        accumulatedMilliseconds = 0
+        measuredSamples = 0
+        lastReportTime = now
+        lock.unlock()
+
+        if let averageMilliseconds {
+            print(String(format: "fps_meter %@ fps=%.1f avg_ms=%.2f", name, fps, averageMilliseconds))
+        } else {
+            print(String(format: "fps_meter %@ fps=%.1f", name, fps))
+        }
+
     }
 }
 
@@ -36,7 +81,8 @@ struct FaceTrackingView: UIViewRepresentable {
         let view = ViewportTrackingARSCNView(frame: .zero)
         view.delegate = context.coordinator
         view.session.delegate = context.coordinator
-        view.automaticallyUpdatesLighting = true
+        view.automaticallyUpdatesLighting = false
+        view.rendersContinuously = true
         view.preferredFramesPerSecond = 60
         view.backgroundColor = .black
         view.scene = SCNScene()
@@ -74,6 +120,17 @@ private final class ViewportTrackingARSCNView: ARSCNView {
     override func layoutSubviews() {
         super.layoutSubviews()
         onLayout?(bounds.size, window?.screen.scale ?? traitCollection.displayScale)
+    }
+}
+
+private enum FaceBlendShapeValue {
+    static func value(_ location: ARFaceAnchor.BlendShapeLocation,
+                      in blendShapes: [ARFaceAnchor.BlendShapeLocation: NSNumber]) -> Float {
+        guard let value = blendShapes[location]?.floatValue,
+              value.isFinite else {
+            return 0
+        }
+        return min(max(value, 0), 1)
     }
 }
 
@@ -183,6 +240,39 @@ private struct LipContour {
 
     func transformed(from source: LipPose, to target: LipPose) -> LipContour {
         let scale = min(max(target.width / max(source.width, 1), 0.65), 1.45)
+        let angleDelta = target.angle - source.angle
+        let cosine = cos(angleDelta)
+        let sine = sin(angleDelta)
+
+        func transform(_ point: CGPoint) -> CGPoint {
+            let x = (point.x - source.center.x) * scale
+            let y = (point.y - source.center.y) * scale
+            return CGPoint(
+                x: target.center.x + x * cosine - y * sine,
+                y: target.center.y + x * sine + y * cosine
+            )
+        }
+
+        return LipContour(
+            outer: outer.map(transform),
+            inner: inner.map(transform),
+            outer3D: outer3D,
+            inner3D: inner3D,
+            outerUV: outerUV,
+            innerUV: innerUV,
+            meshPointsByIndex: meshPointsByIndex.mapValues {
+                LipMeshPoint(
+                    screen: transform($0.screen),
+                    normalized: $0.normalized,
+                    uv: $0.uv
+                )
+            },
+            faceGeometryPose: faceGeometryPose
+        )
+    }
+
+    func transformed(from source: LipMotionPose, to target: LipMotionPose) -> LipContour {
+        let scale = min(max(target.width / max(source.width, 1), 0.70), 1.42)
         let angleDelta = target.angle - source.angle
         let cosine = cos(angleDelta)
         let sine = sin(angleDelta)
@@ -353,6 +443,10 @@ private struct FaceLocalMouthFrame {
     let openingRatio: Float
     let referenceWidth: Float
     let verticalAlignment: Float
+    let jawOpen: Float
+    let smileLeft: Float
+    let smileRight: Float
+    let upperLipRaise: Float
 
     func translated(by offset: SIMD3<Float>) -> FaceLocalMouthFrame {
         FaceLocalMouthFrame(
@@ -364,7 +458,11 @@ private struct FaceLocalMouthFrame {
             smileExpansion: smileExpansion,
             openingRatio: openingRatio,
             referenceWidth: referenceWidth,
-            verticalAlignment: verticalAlignment
+            verticalAlignment: verticalAlignment,
+            jawOpen: jawOpen,
+            smileLeft: smileLeft,
+            smileRight: smileRight,
+            upperLipRaise: upperLipRaise
         )
     }
 }
@@ -396,6 +494,7 @@ private enum CanonicalLipGeometry {
 
     private static let outerLipIndexSet = Set(outerLipIndices)
     private static let cornerLipIndexSet = Set([61, 291, 78, 308, 76, 306, 62, 292])
+    private static let cornerSupportLipIndexSet = Set([185, 40, 191, 80, 184, 74, 183, 42, 409, 270, 415, 310, 408, 304, 407, 272])
     private static let upperOuterLipIndexSet = Set([409, 270, 269, 267, 0, 37, 39, 40, 185])
     private static let upperSupportLipIndexSet = Set([408, 304, 303, 302, 11, 72, 73, 74, 184])
     private static let upperInnerSupportLipIndexSet = Set([183, 42, 41, 38, 12, 268, 271, 272, 407])
@@ -423,18 +522,47 @@ private enum CanonicalLipGeometry {
         return 0
     }
 
+    static func smileStretchFactor(for index: Int) -> Float {
+        if cornerLipIndexSet.contains(index) {
+            return 0.060
+        }
+        if cornerSupportLipIndexSet.contains(index) {
+            return 0.035
+        }
+        if upperOuterLipIndexSet.contains(index) || lowerOuterLipIndexSet.contains(index) {
+            return 0.018
+        }
+        return 0
+    }
+
+    static func jawOpenDropFactor(for index: Int) -> Float {
+        if lowerOuterLipIndexSet.contains(index) {
+            return 0.12
+        }
+        if lowerSupportLipIndexSet.contains(index) {
+            return 0.09
+        }
+        if lowerInnerSupportLipIndexSet.contains(index) {
+            return 0.05
+        }
+        return 0
+    }
+
     static func meshExpansionScale(for index: Int) -> CGFloat {
         if cornerLipIndexSet.contains(index) {
-            return 1.018
+            return 1.070
+        }
+        if cornerSupportLipIndexSet.contains(index) {
+            return 1.045
         }
         if upperOuterLipIndexSet.contains(index) {
-            return 1.100
+            return 1.085
         }
         if upperSupportLipIndexSet.contains(index) {
-            return 1.075
+            return 1.060
         }
         if upperInnerSupportLipIndexSet.contains(index) {
-            return 1.145
+            return 1.105
         }
         if lowerOuterLipIndexSet.contains(index) {
             return 1.20
@@ -857,7 +985,8 @@ fileprivate final class LipMeshRenderer {
                 renderer: SCNSceneRenderer,
                 faceNode: SCNNode,
                 contourAge: CFTimeInterval,
-                motionDelta: CGFloat) {
+                motionDelta: CGFloat,
+                openingScale: Float) {
         let correctedMouthFrame = mouthFrame.translated(
             by: projectionAlignmentCorrection(
                 contour: contour,
@@ -869,7 +998,12 @@ fileprivate final class LipMeshRenderer {
             )
         )
 
-        guard let geometry = makeGeometry(contour: contour, texture: texture, mouthFrame: correctedMouthFrame) else {
+        guard let geometry = makeGeometry(
+            contour: contour,
+            texture: texture,
+            mouthFrame: correctedMouthFrame,
+            openingScale: openingScale
+        ) else {
             clearLip()
             return
         }
@@ -891,6 +1025,14 @@ fileprivate final class LipMeshRenderer {
             )
         } else {
             clearDebugLines()
+            logAttachmentDiagnostics(
+                contour: contour,
+                mouthFrame: correctedMouthFrame,
+                renderer: renderer,
+                faceNode: faceNode,
+                contourAge: contourAge,
+                motionDelta: motionDelta
+            )
         }
     }
 
@@ -919,7 +1061,8 @@ fileprivate final class LipMeshRenderer {
 
     private func makeGeometry(contour: LipContour,
                               texture: LipTexture,
-                              mouthFrame: FaceLocalMouthFrame) -> SCNGeometry? {
+                              mouthFrame: FaceLocalMouthFrame,
+                              openingScale: Float) -> SCNGeometry? {
         guard let pose = contour.pose else {
             LipDebugLog.throttled(
                 "lip_mesh_nil_pose",
@@ -947,7 +1090,13 @@ fileprivate final class LipMeshRenderer {
             return nil
         }
 
-        let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
+        let contourOpeningRatio = Self.mouthOpeningRatio(contour)
+        let fillClosedMouthSeam = contourOpeningRatio < 0.034 && mouthFrame.jawOpen < 0.070
+        let mesh = makeCanonicalLipMesh(
+            contour: contour,
+            pose: pose,
+            fillInnerSeam: fillClosedMouthSeam
+        )
         guard mesh.vertices.count >= 4, !mesh.indices.isEmpty else {
             LipDebugLog.throttled(
                 "lip_mesh_empty_geometry",
@@ -965,7 +1114,7 @@ fileprivate final class LipMeshRenderer {
         )
 
         let vertices = mesh.vertices.map {
-            scenePoint(for: $0, pose: pose, contour: contour, mouthFrame: mouthFrame)
+            scenePoint(for: $0, pose: pose, contour: contour, mouthFrame: mouthFrame, openingScale: openingScale)
         }
         let textureCoordinates = mesh.vertices.map {
             CGPoint(x: $0.uv.x, y: 1 - $0.uv.y)
@@ -1142,23 +1291,24 @@ fileprivate final class LipMeshRenderer {
                                                faceNode: SCNNode,
                                                contourAge: CFTimeInterval,
                                                motionDelta: CGFloat) -> SIMD3<Float> {
-        guard contourAge < 0.055,
-              motionDelta < 0.032 else {
-            return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
-        }
-
-        guard let pose = contour.pose else {
+        guard contourAge < 0.090,
+              motionDelta < 0.075,
+              let pose = contour.pose else {
+            lastCorrectionX *= 0.22
+            lastCorrectionY *= 0.22
             return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
         }
 
         let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
         guard !mesh.vertices.isEmpty else {
+            lastCorrectionX *= 0.12
+            lastCorrectionY *= 0.12
             return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
         }
 
         var sumX: CGFloat = 0
         var sumY: CGFloat = 0
-        var count: CGFloat = 0
+        var weightSum: CGFloat = 0
 
         for vertex in mesh.vertices {
             let local = scenePoint(for: vertex, pose: pose, contour: contour, mouthFrame: mouthFrame)
@@ -1171,39 +1321,37 @@ fileprivate final class LipMeshRenderer {
                 continue
             }
 
-            sumX += screen.x - vertex.screen.x
-            sumY += screen.y - vertex.screen.y
-            count += 1
+            let isUpper = CanonicalLipGeometry.upperDebugIndices.contains(vertex.index)
+            let weight: CGFloat = isUpper ? 1.45 : 1
+            sumX += (screen.x - vertex.screen.x) * weight
+            sumY += (screen.y - vertex.screen.y) * weight
+            weightSum += weight
         }
 
-        guard count > 0 else {
+        guard weightSum > 0 else {
+            lastCorrectionX *= 0.12
+            lastCorrectionY *= 0.12
             return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
         }
 
-        let avgX = sumX / count
-        let avgY = sumY / count
+        let avgX = sumX / weightSum
+        let avgY = sumY / weightSum
         let localUnitsPerPixel = mouthFrame.width / Float(max(pose.width, 1))
-        let maxAxisCorrection = mouthFrame.width * 0.16
-        let correctionGain: Float = 0.82
+        let smileClamp = mouthFrame.smileExpansion > 0.10 ? mouthFrame.width * 0.020 : mouthFrame.width * 0.032
+        let correctionGain: Float = 0.18
         let correctionX = Self.clamped(
             -Float(avgX) * localUnitsPerPixel * correctionGain,
-            minValue: -maxAxisCorrection,
-            maxValue: maxAxisCorrection
+            minValue: -smileClamp,
+            maxValue: smileClamp
         )
         let correctionY = Self.clamped(
             -Float(avgY) * localUnitsPerPixel * correctionGain,
-            minValue: -maxAxisCorrection,
-            maxValue: maxAxisCorrection
-        )
-        lastCorrectionX = lastCorrectionX * 0.38 + correctionX * 0.62
-        lastCorrectionY = lastCorrectionY * 0.38 + correctionY * 0.62
-
-        LipDebugLog.throttled(
-            "lip_projection_correction",
-            interval: 0.22,
-            "lip_projection correction age:\(Self.fmt(CGFloat(contourAge))) motion:\(Self.fmt(motionDelta)) avgX:\(Self.fmt(avgX)) avgY:\(Self.fmt(avgY)) localPerPx:\(String(format: "%.6f", Double(localUnitsPerPixel))) corrX:\(String(format: "%.5f", Double(lastCorrectionX))) corrY:\(String(format: "%.5f", Double(lastCorrectionY)))"
+            minValue: -smileClamp,
+            maxValue: smileClamp
         )
 
+        lastCorrectionX = lastCorrectionX * 0.84 + correctionX * 0.16
+        lastCorrectionY = lastCorrectionY * 0.84 + correctionY * 0.16
         return mouthFrame.xAxis * lastCorrectionX + mouthFrame.downAxis * lastCorrectionY
     }
 
@@ -1268,6 +1416,59 @@ fileprivate final class LipMeshRenderer {
         )
     }
 
+    private func logAttachmentDiagnostics(contour: LipContour,
+                                          mouthFrame: FaceLocalMouthFrame,
+                                          renderer: SCNSceneRenderer,
+                                          faceNode: SCNNode,
+                                          contourAge: CFTimeInterval,
+                                          motionDelta: CGFloat) {
+        guard let pose = contour.pose else {
+            return
+        }
+
+        let mesh = makeCanonicalLipMesh(contour: contour, pose: pose)
+        guard !mesh.vertices.isEmpty else {
+            return
+        }
+
+        var totalError: CGFloat = 0
+        var maxError: CGFloat = 0
+        var count: CGFloat = 0
+        var upperTotalError: CGFloat = 0
+        var upperCount: CGFloat = 0
+
+        for vertex in mesh.vertices {
+            let local = scenePoint(for: vertex, pose: pose, contour: contour, mouthFrame: mouthFrame)
+            let world = faceNode.convertPosition(local, to: nil)
+            let projected = renderer.projectPoint(world)
+            let screen = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            guard screen.x.isFinite,
+                  screen.y.isFinite,
+                  projected.z.isFinite else {
+                continue
+            }
+
+            let error = hypot(screen.x - vertex.screen.x, screen.y - vertex.screen.y)
+            totalError += error
+            maxError = max(maxError, error)
+            count += 1
+            if CanonicalLipGeometry.upperDebugIndices.contains(vertex.index) {
+                upperTotalError += error
+                upperCount += 1
+            }
+        }
+
+        guard count > 0 else {
+            return
+        }
+
+        LipDebugLog.throttled(
+            "lip_attachment_error",
+            interval: 0.75,
+            "lip_attachment error avg=\(Self.fmt(totalError / count)) upper=\(Self.fmt(upperCount > 0 ? upperTotalError / upperCount : 0)) max=\(Self.fmt(maxError)) age=\(Self.fmt(CGFloat(contourAge))) motion=\(Self.fmt(motionDelta)) smile=\(Self.fmt(CGFloat(mouthFrame.smileExpansion))) jaw=\(Self.fmt(CGFloat(mouthFrame.jawOpen)))"
+        )
+    }
+
     private static func deltaStats(for indices: [Int],
                                    in deltasByIndex: [Int: CGPoint]) -> (avgX: CGFloat, avgY: CGFloat, maxDistance: CGFloat, count: Int) {
         var sumX: CGFloat = 0
@@ -1311,6 +1512,16 @@ fileprivate final class LipMeshRenderer {
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
+    private static func mouthOpeningRatio(_ contour: LipContour) -> CGFloat {
+        guard let outerBounds = bounds(for: contour.outer),
+              let innerBounds = bounds(for: contour.inner),
+              outerBounds.width > 1 else {
+            return 0
+        }
+
+        return innerBounds.height / outerBounds.width
+    }
+
     private func boundsText(_ bounds: CGRect?) -> String {
         guard let bounds else {
             return "nil"
@@ -1327,7 +1538,9 @@ fileprivate final class LipMeshRenderer {
         min(max(value, minValue), maxValue)
     }
 
-    private func makeCanonicalLipMesh(contour: LipContour, pose: LipPose) -> (vertices: [MeshVertex], indices: [Int32]) {
+    private func makeCanonicalLipMesh(contour: LipContour,
+                                      pose: LipPose,
+                                      fillInnerSeam: Bool = false) -> (vertices: [MeshVertex], indices: [Int32]) {
         var vertices: [MeshVertex] = []
         var indices: [Int32] = []
         var vertexIndexByLandmark: [Int: Int32] = [:]
@@ -1388,6 +1601,33 @@ fileprivate final class LipMeshRenderer {
             return newIndex
         }
 
+        func appendInnerSeamFill() {
+            let lowerPositions = Array(0...10)
+            let upperPositions = [0] + Array(stride(from: 19, through: 10, by: -1))
+            guard lowerPositions.count == upperPositions.count else {
+                return
+            }
+
+            for offset in 0..<(lowerPositions.count - 1) {
+                let lowerFirstIndex = CanonicalLipGeometry.innerLipIndices[lowerPositions[offset]]
+                let lowerSecondIndex = CanonicalLipGeometry.innerLipIndices[lowerPositions[offset + 1]]
+                let upperFirstIndex = CanonicalLipGeometry.innerLipIndices[upperPositions[offset]]
+                let upperSecondIndex = CanonicalLipGeometry.innerLipIndices[upperPositions[offset + 1]]
+                guard let lowerFirst = meshVertex(for: lowerFirstIndex),
+                      let lowerSecond = meshVertex(for: lowerSecondIndex),
+                      let upperFirst = meshVertex(for: upperFirstIndex),
+                      let upperSecond = meshVertex(for: upperSecondIndex) else {
+                    continue
+                }
+
+                let a = appendOrReuse(lowerFirst)
+                let b = appendOrReuse(lowerSecond)
+                let c = appendOrReuse(upperFirst)
+                let d = appendOrReuse(upperSecond)
+                indices.append(contentsOf: [a, b, c, b, d, c])
+            }
+        }
+
         for triangle in CanonicalLipGeometry.lipMeshTriangles {
             guard let first = meshVertex(for: triangle.0),
                   let second = meshVertex(for: triangle.1),
@@ -1403,6 +1643,9 @@ fileprivate final class LipMeshRenderer {
         }
 
         if !indices.isEmpty {
+            if fillInnerSeam {
+                appendInnerSeamFill()
+            }
             return (vertices, indices)
         }
 
@@ -1455,6 +1698,9 @@ fileprivate final class LipMeshRenderer {
             outerPositions: [0] + Array(stride(from: 19, through: 10, by: -1)),
             innerPositions: [0] + Array(stride(from: 19, through: 10, by: -1))
         )
+        if fillInnerSeam {
+            appendInnerSeamFill()
+        }
 
         return (vertices, indices)
     }
@@ -1462,13 +1708,21 @@ fileprivate final class LipMeshRenderer {
     private func scenePoint(for vertex: MeshVertex,
                             pose: LipPose,
                             contour: LipContour,
-                            mouthFrame: FaceLocalMouthFrame) -> SCNVector3 {
+                            mouthFrame: FaceLocalMouthFrame,
+                            openingScale: Float = 1) -> SCNVector3 {
         let cosine = cos(pose.angle)
         let sine = sin(pose.angle)
         let dx = Float(vertex.screen.x - pose.center.x)
         let dy = Float(vertex.screen.y - pose.center.y)
-        let normalizedX = (dx * Float(cosine) + dy * Float(sine)) / Float(max(pose.width, 1))
-        let normalizedY = (-dx * Float(sine) + dy * Float(cosine)) / Float(max(pose.width, 1))
+        var normalizedX = (dx * Float(cosine) + dy * Float(sine)) / Float(max(pose.width, 1))
+        let rawNormalizedY = (-dx * Float(sine) + dy * Float(cosine)) / Float(max(pose.width, 1))
+        let verticalPrediction = Self.verticalPredictionWeight(for: vertex.index)
+        let sideSmile = normalizedX < 0 ? mouthFrame.smileLeft : mouthFrame.smileRight
+        let smileDriver = max(mouthFrame.smileExpansion, sideSmile)
+        normalizedX *= 1 + smileDriver * CanonicalLipGeometry.smileStretchFactor(for: vertex.index)
+
+        var normalizedY = rawNormalizedY * (1 + (openingScale - 1) * verticalPrediction)
+        normalizedY += mouthFrame.jawOpen * CanonicalLipGeometry.jawOpenDropFactor(for: vertex.index) * 0.030
         let depthDelta = max(min(vertex.normalized.z - contour.depthCenter, 0.08), -0.08)
         let canonicalDepthDelta = max(
             min(contour.faceGeometryPose?.relativeCanonicalDepth(for: vertex.index) ?? 0, 0.08),
@@ -1479,9 +1733,10 @@ fileprivate final class LipMeshRenderer {
         let depthOffset = surfaceOffset -
             depthDelta * mouthFrame.width * 0.45 * geometryScale -
             canonicalDepthDelta * mouthFrame.width * 0.22
+        let upperDriver = max(mouthFrame.upperLipRaise, smileDriver * 0.62)
         let smileLift = CanonicalLipGeometry.upperLipSmileLiftFactor(for: vertex.index) *
-            min(max(mouthFrame.smileExpansion, 0), 1) *
-            mouthFrame.width * 0.016
+            min(max(upperDriver, 0), 1) *
+            mouthFrame.width * 0.015
 
         let local = mouthFrame.center +
             mouthFrame.xAxis * (normalizedX * mouthFrame.width) +
@@ -1492,6 +1747,19 @@ fileprivate final class LipMeshRenderer {
     }
 
     private static let lipPointCount = 20
+
+    private static func verticalPredictionWeight(for index: Int) -> Float {
+        if CanonicalLipGeometry.innerLipIndices.contains(index) {
+            return 0.88
+        }
+        if CanonicalLipGeometry.upperDebugIndices.contains(index) {
+            return 0.42
+        }
+        if [146, 91, 181, 84, 17, 314, 405, 321, 375].contains(index) {
+            return 0.52
+        }
+        return 0.34
+    }
 }
 
 private struct LipTexture {
@@ -1505,13 +1773,35 @@ private struct RGBColor {
 }
 
 private final class LipTextureRenderer {
+    private struct TextureCacheKey: Hashable {
+        let red: UInt8
+        let green: UInt8
+        let blue: UInt8
+        let excludesInnerMouth: Bool
+        let width: Int
+        let height: Int
+        let scale: Int
+    }
+
+    private let temporalTextureLock = NSLock()
+    private let textureCacheLock = NSLock()
+    private var previousTextureRGBA: [UInt8]?
+    private var previousTextureWidth = 0
+    private var previousTextureHeight = 0
+    private var previousTextureColor: RGBColor?
+    private var textureCache: [TextureCacheKey: LipTexture] = [:]
+
     private struct CanonicalLipSample {
         let point: CGPoint
         let alpha: Float
+        let outerDistance: CGFloat
+        let innerDistance: CGFloat
     }
 
     private struct CanonicalAlphaSample {
         let alpha: Float
+        let outerDistance: CGFloat
+        let innerDistance: CGFloat
     }
 
     private struct CanonicalLipSampler {
@@ -1526,8 +1816,9 @@ private final class LipTextureRenderer {
         private let innerBoundarySegments: [(CGPoint, CGPoint)]
         private let outerBoundary: [CGPoint]
         private let innerBoundary: [CGPoint]
+        private let excludesInnerMouth: Bool
 
-        init?(contour: LipContour) {
+        init?(contour: LipContour, excludesInnerMouth: Bool) {
             guard contour.outer.count == 20,
                   contour.inner.count == 20,
                   contour.outerUV.count == 20,
@@ -1639,6 +1930,7 @@ private final class LipTextureRenderer {
             innerBoundarySegments = builtInnerBoundary
             outerBoundary = contour.outerUV
             innerBoundary = contour.innerUV
+            self.excludesInnerMouth = excludesInnerMouth
         }
 
         func sample(u: CGFloat, topV: CGFloat) -> CanonicalLipSample? {
@@ -1646,7 +1938,12 @@ private final class LipTextureRenderer {
                   let screen = screenPoint(u: u, topV: topV) else {
                 return nil
             }
-            return CanonicalLipSample(point: screen, alpha: alphaSample.alpha)
+            return CanonicalLipSample(
+                point: screen,
+                alpha: alphaSample.alpha,
+                outerDistance: alphaSample.outerDistance,
+                innerDistance: alphaSample.innerDistance
+            )
         }
 
         func alphaSample(u: CGFloat, topV: CGFloat) -> CanonicalAlphaSample? {
@@ -1654,15 +1951,32 @@ private final class LipTextureRenderer {
                 return nil
             }
 
-            let outerAlpha = Self.smoothStep(edge0: 0.004, edge1: 0.12, value: edgeDistances.outer)
-            let innerEdgeAlpha = Self.smoothStep(edge0: 0.0005, edge1: 0.022, value: edgeDistances.inner)
             let lowerRegion = edgeDistances.uv.y > 0.30
-            let edgeFloor: CGFloat = lowerRegion ? 0.62 : 0.46
-            let innerFloor: CGFloat = lowerRegion ? 0.74 : 0.64
-            let regionBoost: CGFloat = lowerRegion ? 1.24 : 1.12
-            let innerAlpha = innerFloor + innerEdgeAlpha * (1 - innerFloor)
-            let alpha = min((edgeFloor + outerAlpha * (1 - edgeFloor)) * innerAlpha * regionBoost, 1)
-            return CanonicalAlphaSample(alpha: Float(alpha))
+            let outerVeil = Self.smoothStep(edge0: 0.0,
+                                            edge1: lowerRegion ? 0.052 : 0.046,
+                                            value: edgeDistances.outer)
+            let outerCore = Self.smoothStep(edge0: lowerRegion ? 0.030 : 0.026,
+                                            edge1: lowerRegion ? 0.112 : 0.100,
+                                            value: edgeDistances.outer)
+            let innerVeil = excludesInnerMouth ? Self.smoothStep(edge0: 0.0,
+                                                                  edge1: lowerRegion ? 0.024 : 0.020,
+                                                                  value: edgeDistances.inner) : 1
+            let innerCore = excludesInnerMouth ? Self.smoothStep(edge0: lowerRegion ? 0.014 : 0.012,
+                                                                 edge1: lowerRegion ? 0.060 : 0.052,
+                                                                 value: edgeDistances.inner) : 1
+            let outerAlpha = min((lowerRegion ? 0.30 : 0.24) + outerVeil * 0.44 + outerCore * 0.32, 1)
+            let innerAlpha = min(0.50 + innerVeil * 0.34 + innerCore * 0.16, 1)
+            let cornerDistance = min(edgeDistances.uv.x, 1 - edgeDistances.uv.x)
+            let cornerBody = Self.smoothStep(edge0: 0.016, edge1: 0.185, value: cornerDistance)
+            let cornerEdge = Self.smoothStep(edge0: 0.0, edge1: 0.110, value: edgeDistances.outer)
+            let cornerFade = 0.38 + max(cornerBody, cornerEdge) * 0.48
+            let regionBoost: CGFloat = lowerRegion ? 1.16 : 1.10
+            let alpha = min(outerAlpha * innerAlpha * cornerFade * regionBoost, 1)
+            return CanonicalAlphaSample(
+                alpha: Float(alpha),
+                outerDistance: edgeDistances.outer,
+                innerDistance: edgeDistances.inner
+            )
         }
 
         private func screenPoint(u: CGFloat, topV: CGFloat) -> CGPoint? {
@@ -1687,20 +2001,10 @@ private final class LipTextureRenderer {
 
         private func edgeDistances(u: CGFloat, topV: CGFloat) -> (outer: CGFloat, inner: CGFloat, uv: CGPoint)? {
             let uv = CGPoint(x: max(0, min(u, 1)), y: 1 - max(0, min(topV, 1)))
-            guard triangles.contains(where: { triangle in
-                Self.barycentric(
-                    point: uv,
-                    a: vertices[triangle.0].uv,
-                    b: vertices[triangle.1].uv,
-                    c: vertices[triangle.2].uv
-                ) != nil
-            }) else {
+            guard Self.pointInPolygon(uv, polygon: outerBoundary),
+                  (!excludesInnerMouth || !Self.pointInPolygon(uv, polygon: innerBoundary)) else {
                 return nil
             }
-//            guard Self.pointInPolygon(uv, polygon: outerBoundary),
-//                  !Self.pointInPolygon(uv, polygon: innerBoundary) else {
-//                return nil
-//            }
 
             let outerDistance = outerBoundarySegments.reduce(CGFloat.greatestFiniteMagnitude) { current, segment in
                 min(current, Self.distance(from: uv, to: segment))
@@ -1782,6 +2086,24 @@ private final class LipTextureRenderer {
             return isInside
         }
 
+        private static func bounds(for points: [CGPoint]) -> CGRect? {
+            guard let first = points.first else {
+                return nil
+            }
+
+            var minX = first.x
+            var maxX = first.x
+            var minY = first.y
+            var maxY = first.y
+            for point in points.dropFirst() {
+                minX = min(minX, point.x)
+                maxX = max(maxX, point.x)
+                minY = min(minY, point.y)
+                maxY = max(maxY, point.y)
+            }
+            return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+
         private static func smoothStep(edge0: CGFloat, edge1: CGFloat, value: CGFloat) -> CGFloat {
             let t = max(0, min((value - edge0) / max(edge1 - edge0, 0.0001), 1))
             return t * t * (3 - 2 * t)
@@ -1791,7 +2113,8 @@ private final class LipTextureRenderer {
     private let colorLock = NSLock()
     private var lipstickColor = RGBColor(red: 0.82, green: 0.08, blue: 0.08)
 
-    func updateColor(_ color: UIColor) {
+    @discardableResult
+    func updateColor(_ color: UIColor) -> Bool {
         let matteColor = Self.matteLipColor(from: color)
         var red: CGFloat = 0
         var green: CGFloat = 0
@@ -1800,8 +2123,36 @@ private final class LipTextureRenderer {
         matteColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
 
         colorLock.lock()
-        lipstickColor = RGBColor(red: Float(red), green: Float(green), blue: Float(blue))
+        let nextColor = RGBColor(red: Float(red), green: Float(green), blue: Float(blue))
+        let colorDistance = Self.colorDistance(lipstickColor, nextColor)
+        let didChange = colorDistance > 0.020
+        if didChange {
+            lipstickColor = nextColor
+        }
         colorLock.unlock()
+
+        guard didChange else {
+            return false
+        }
+
+        textureCacheLock.lock()
+        textureCache.removeAll()
+        textureCacheLock.unlock()
+        LipDebugLog.throttled(
+            "lip_color_update",
+            interval: 0.2,
+            "lip_color update distance=\(String(format: "%.4f", Double(colorDistance))) rgb=(\(String(format: "%.3f", Double(nextColor.red))),\(String(format: "%.3f", Double(nextColor.green))),\(String(format: "%.3f", Double(nextColor.blue))))"
+        )
+        return true
+    }
+
+    func resetTemporalState() {
+        temporalTextureLock.lock()
+        previousTextureRGBA = nil
+        previousTextureWidth = 0
+        previousTextureHeight = 0
+        previousTextureColor = nil
+        temporalTextureLock.unlock()
     }
 
     func makeTexture(contour: LipContour,
@@ -1809,6 +2160,7 @@ private final class LipTextureRenderer {
                      imageSize: CGSize,
                      viewportSize: CGSize,
                      renderScale: CGFloat,
+                     excludesInnerMouth: Bool,
                      lowLatency: Bool = false) -> LipTexture? {
         guard viewportSize.width > 1,
               viewportSize.height > 1,
@@ -1821,7 +2173,25 @@ private final class LipTextureRenderer {
             return nil
         }
 
-        guard let sampler = CanonicalLipSampler(contour: contour) else {
+        let pixelWidth = lowLatency ? 192 : 256
+        let pixelHeight = lowLatency ? 96 : 128
+
+        let color = currentLipstickColor()
+        let cacheKey = Self.textureCacheKey(
+            color: color,
+            excludesInnerMouth: excludesInnerMouth,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            renderScale: renderScale
+        )
+        textureCacheLock.lock()
+        if let cached = textureCache[cacheKey] {
+            textureCacheLock.unlock()
+            return cached
+        }
+        textureCacheLock.unlock()
+
+        guard let sampler = CanonicalLipSampler(contour: contour, excludesInnerMouth: excludesInnerMouth) else {
             LipDebugLog.throttled(
                 "lip_texture_no_sampler",
                 "lip_texture nil reason=no_sampler outer=\(contour.outer.count) inner=\(contour.inner.count) outerUV=\(contour.outerUV.count) innerUV=\(contour.innerUV.count)"
@@ -1829,58 +2199,29 @@ private final class LipTextureRenderer {
             return nil
         }
 
-        let pixelWidth = lowLatency ? 192 : 256
-        let pixelHeight = lowLatency ? 96 : 128
-
-        let imageTransform = Self.aspectFillTransform(for: imageSize, in: viewportSize)
-        let inverseImageTransform = imageTransform.inverted()
-        let color = currentLipstickColor()
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer {
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-        }
-
-        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-            return nil
-        }
-
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
-
         var rgba = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
         var alphaPixels = 0
-        var sampledPixels = 0
-        var outOfImagePixels = 0
         var paintedPixels = 0
         for y in 0..<pixelHeight {
             for x in 0..<pixelWidth {
                 let u = (CGFloat(x) + 0.5) / CGFloat(pixelWidth)
                 let topV = (CGFloat(y) + 0.5) / CGFloat(pixelHeight)
-                guard let sample = sampler.sample(u: u, topV: topV),
+                guard let sample = sampler.alphaSample(u: u, topV: topV),
                       sample.alpha > 0.01 else {
                     continue
                 }
                 alphaPixels += 1
 
-                let imagePoint = sample.point.applying(inverseImageTransform)
-                if Self.samplePixel(
-                    at: imagePoint,
-                    baseAddress: baseAddress,
-                    bytesPerRow: bytesPerRow,
-                    width: sourceWidth,
-                    height: sourceHeight
-                ) != nil {
-                    sampledPixels += 1
-                } else {
-                    outOfImagePixels += 1
-                }
-
                 let edgeNoise = Self.edgeNoise(maskAlpha: sample.alpha, x: x, y: y, frame: .zero)
-                let coverageAlpha = max(sample.alpha, lowLatency ? 0.74 : 0.66)
-                let alpha = min(coverageAlpha * 0.90 * edgeNoise, lowLatency ? 0.88 : 0.84)
-                let lipRGB = color
+                let pigmentVariation = Self.stableLipPigmentVariation(u: u, topV: topV)
+                let alpha = min(sample.alpha * 0.92 * edgeNoise * pigmentVariation.alpha, lowLatency ? 0.88 : 0.84)
+                let lipBase = Self.stableLipBaseColor(u: u, topV: topV)
+                let lipRGB = Self.pigmentBlendedColor(
+                    lipstick: color,
+                    lipBase: lipBase,
+                    coverage: sample.alpha,
+                    variation: pigmentVariation.color
+                )
                 let offset = (y * pixelWidth + x) * 4
                 rgba[offset] = Self.uint8(lipRGB.red * alpha)
                 rgba[offset + 1] = Self.uint8(lipRGB.green * alpha)
@@ -1908,7 +2249,7 @@ private final class LipTextureRenderer {
         LipDebugLog.throttled(
             "lip_texture_stats",
             interval: 0.6,
-            "lip_texture stats size=\(pixelWidth)x\(pixelHeight) lowLatency=\(lowLatency) alphaPixels=\(alphaPixels) sampled=\(sampledPixels) outOfImage=\(outOfImagePixels) painted=\(paintedPixels) fallback=\(usedFallback) fallbackPainted=\(fallbackPaintedPixels) image=\(Int(imageSize.width))x\(Int(imageSize.height)) viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height))"
+            "lip_texture stats size=\(pixelWidth)x\(pixelHeight) lowLatency=\(lowLatency) alphaPixels=\(alphaPixels) painted=\(paintedPixels) fallback=\(usedFallback) fallbackPainted=\(fallbackPaintedPixels) image=\(Int(imageSize.width))x\(Int(imageSize.height)) viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height))"
         )
 
         guard let provider = CGDataProvider(data: Data(rgba) as CFData),
@@ -1932,7 +2273,11 @@ private final class LipTextureRenderer {
             return nil
         }
 
-        return LipTexture(image: UIImage(cgImage: cgImage, scale: renderScale, orientation: .up))
+        let texture = LipTexture(image: UIImage(cgImage: cgImage, scale: renderScale, orientation: .up))
+        textureCacheLock.lock()
+        textureCache[cacheKey] = texture
+        textureCacheLock.unlock()
+        return texture
     }
 
     private static func makeFallbackRGBA(sampler: CanonicalLipSampler,
@@ -1951,12 +2296,19 @@ private final class LipTextureRenderer {
                 }
 
                 let edgeNoise = edgeNoise(maskAlpha: sample.alpha, x: x, y: y, frame: .zero)
-                let coverageAlpha = max(sample.alpha, 0.68)
-                let alpha = min(coverageAlpha * 0.90 * edgeNoise, 0.86)
+                let pigmentVariation = stableLipPigmentVariation(u: u, topV: topV)
+                let alpha = min(sample.alpha * 0.90 * edgeNoise * pigmentVariation.alpha, 0.86)
+                let lipBase = stableLipBaseColor(u: u, topV: topV)
+                let lipRGB = pigmentBlendedColor(
+                    lipstick: color,
+                    lipBase: lipBase,
+                    coverage: sample.alpha,
+                    variation: pigmentVariation.color
+                )
                 let offset = (y * pixelWidth + x) * 4
-                rgba[offset] = uint8(color.red * alpha)
-                rgba[offset + 1] = uint8(color.green * alpha)
-                rgba[offset + 2] = uint8(color.blue * alpha)
+                rgba[offset] = uint8(lipRGB.red * alpha)
+                rgba[offset + 1] = uint8(lipRGB.green * alpha)
+                rgba[offset + 2] = uint8(lipRGB.blue * alpha)
                 rgba[offset + 3] = uint8(alpha)
                 paintedPixels += 1
             }
@@ -1969,6 +2321,22 @@ private final class LipTextureRenderer {
         let color = lipstickColor
         colorLock.unlock()
         return color
+    }
+
+    private static func textureCacheKey(color: RGBColor,
+                                        excludesInnerMouth: Bool,
+                                        pixelWidth: Int,
+                                        pixelHeight: Int,
+                                        renderScale: CGFloat) -> TextureCacheKey {
+        TextureCacheKey(
+            red: uint8(color.red),
+            green: uint8(color.green),
+            blue: uint8(color.blue),
+            excludesInnerMouth: excludesInnerMouth,
+            width: pixelWidth,
+            height: pixelHeight,
+            scale: Int((renderScale * 100).rounded())
+        )
     }
 
     private func averageCoreLipColor(frame: CGRect,
@@ -2034,12 +2402,77 @@ private final class LipTextureRenderer {
             luminance = min(luminance, 0.50)
         }
 
-        let textureGain = max(0.36, min(0.48 + luminance * 0.92, 1.14))
+        let textureGain = max(0.34, min(0.44 + luminance * 0.98, 1.16))
+        let highlight = Self.smoothStep((luminance - 0.62) / 0.26)
         return RGBColor(
-            red: min(lipstick.red * textureGain, 1),
-            green: min(lipstick.green * textureGain, 1),
-            blue: min(lipstick.blue * textureGain, 1)
+            red: min(lipstick.red * textureGain + base.red * highlight * 0.10, 1),
+            green: min(lipstick.green * textureGain + base.green * highlight * 0.10, 1),
+            blue: min(lipstick.blue * textureGain + base.blue * highlight * 0.10, 1)
         )
+    }
+
+    private static func pigmentAlphaScale(base: RGBColor,
+                                          outerDistance: CGFloat,
+                                          innerDistance: CGFloat) -> Float {
+        let luminance = max(0, min(base.red * 0.299 + base.green * 0.587 + base.blue * 0.114, 1))
+        let highlight = smoothStep((luminance - 0.62) / 0.28)
+        let outerCore = smoothStep((Float(outerDistance) - 0.018) / 0.070)
+        let innerCore = smoothStep((Float(innerDistance) - 0.010) / 0.045)
+        var scale = 1 - highlight * 0.20 * max(outerCore, innerCore)
+
+        if isToothLike(base) && innerDistance < 0.060 {
+            scale *= 0.24
+        }
+
+        return max(0.28, min(scale, 1))
+    }
+
+    private static func stableLipBaseColor(u: CGFloat, topV: CGFloat) -> RGBColor {
+        let center = 1 - min(abs(Float(u) - 0.5) * 2, 1)
+        let vertical = 1 - min(abs(Float(topV) - 0.52) * 1.75, 1)
+        let softWarmth = stableWave(u: u, topV: topV, ux: 7.0, vy: 3.5, phase: 0.25)
+        let fineCrease = stableWave(u: u, topV: topV, ux: 33.0, vy: 5.0, phase: 1.7)
+        let tone = 0.92 + center * 0.08 + vertical * 0.05 + softWarmth * 0.035 - fineCrease * 0.025
+
+        return RGBColor(
+            red: clamp01(0.58 * tone + center * 0.035),
+            green: clamp01(0.255 * tone + softWarmth * 0.020),
+            blue: clamp01(0.305 * tone + vertical * 0.018)
+        )
+    }
+
+    private static func pigmentBlendedColor(lipstick: RGBColor,
+                                            lipBase: RGBColor,
+                                            coverage: Float,
+                                            variation: Float) -> RGBColor {
+        let coverage = clamp01(coverage)
+        let baseInfluence = 0.16 + (1 - coverage) * 0.12
+        let pigmentStrength = 0.86 + coverage * 0.08
+        let texture = 0.965 + variation * 0.055
+
+        let red = lipstick.red * pigmentStrength * texture + lipBase.red * baseInfluence
+        let green = lipstick.green * pigmentStrength * texture + lipBase.green * baseInfluence
+        let blue = lipstick.blue * pigmentStrength * texture + lipBase.blue * baseInfluence
+
+        return RGBColor(red: clamp01(red), green: clamp01(green), blue: clamp01(blue))
+    }
+
+    private static func stableLipPigmentVariation(u: CGFloat, topV: CGFloat) -> (alpha: Float, color: Float) {
+        let broad = stableWave(u: u, topV: topV, ux: 5.0, vy: 4.5, phase: 0.8)
+        let crease = stableWave(u: u, topV: topV, ux: 42.0, vy: 2.0, phase: 2.4)
+        let verticalCrease = stableWave(u: u, topV: topV, ux: 68.0, vy: 0.6, phase: 0.1)
+        let color = broad * 0.55 + crease * 0.28 + verticalCrease * 0.17
+        let alpha = 0.975 + (broad - 0.5) * 0.030 + (verticalCrease - 0.5) * 0.018
+        return (max(0.94, min(alpha, 1.02)), color)
+    }
+
+    private static func stableWave(u: CGFloat,
+                                   topV: CGFloat,
+                                   ux: Double,
+                                   vy: Double,
+                                   phase: Double) -> Float {
+        let value = sin(Double(u) * ux + Double(topV) * vy + phase)
+        return Float(value * 0.5 + 0.5)
     }
 
     private static func isToothLike(_ color: RGBColor) -> Bool {
@@ -2151,7 +2584,7 @@ private final class LipTextureRenderer {
             for x in 1..<(pixelWidth - 1) {
                 let offset = (y * pixelWidth + x) * 4
                 let originalAlpha = rgba[offset + 3]
-                guard originalAlpha > 0, originalAlpha < 245 else {
+                guard originalAlpha > 0, originalAlpha < 248 else {
                     continue
                 }
 
@@ -2171,7 +2604,10 @@ private final class LipTextureRenderer {
                 }
 
                 let edgeBlend = Float(255 - originalAlpha) / 255
-                let blurBlend = min(max(edgeBlend * 0.62, 0), 0.46)
+                let normalizedX = Float(x) / Float(max(pixelWidth - 1, 1))
+                let cornerProximity = max(0, 1 - min(normalizedX, 1 - normalizedX) / 0.20)
+                let cornerBlend = smoothStep(cornerProximity)
+                let blurBlend = min(max(edgeBlend * 0.86 + cornerBlend * 0.24, 0), 0.68)
                 let blurredAlpha = UInt8(alpha / totalWeight)
                 output[offset] = blendChannel(original: rgba[offset], blurred: UInt8(red / totalWeight), amount: blurBlend)
                 output[offset + 1] = blendChannel(original: rgba[offset + 1], blurred: UInt8(green / totalWeight), amount: blurBlend)
@@ -2183,9 +2619,71 @@ private final class LipTextureRenderer {
         return output
     }
 
+    private func temporallyStabilizedRGBA(_ rgba: [UInt8],
+                                          pixelWidth: Int,
+                                          pixelHeight: Int,
+                                          color: RGBColor,
+                                          lowLatency: Bool) -> [UInt8] {
+        temporalTextureLock.lock()
+        defer {
+            temporalTextureLock.unlock()
+        }
+
+        guard let previous = previousTextureRGBA,
+              previousTextureWidth == pixelWidth,
+              previousTextureHeight == pixelHeight,
+              previous.count == rgba.count,
+              previousTextureColor.map({ Self.colorDistance($0, color) < 0.035 }) == true else {
+            previousTextureRGBA = rgba
+            previousTextureWidth = pixelWidth
+            previousTextureHeight = pixelHeight
+            previousTextureColor = color
+            return rgba
+        }
+
+        var output = rgba
+        let baseCurrentWeight: Float = lowLatency ? 0.94 : 0.84
+        for index in stride(from: 0, to: rgba.count, by: 4) {
+            let currentAlpha = rgba[index + 3]
+            let previousAlpha = previous[index + 3]
+            guard currentAlpha > 0, previousAlpha > 0 else {
+                continue
+            }
+
+            let alphaDelta = abs(Float(currentAlpha) - Float(previousAlpha)) / 255
+            let edgeBoost = 1 - min(Float(currentAlpha), Float(previousAlpha)) / 255
+            let currentWeight = min(0.94, baseCurrentWeight + alphaDelta * 0.22 + edgeBoost * 0.08)
+            output[index] = Self.blendByte(previous: previous[index], current: rgba[index], currentWeight: currentWeight)
+            output[index + 1] = Self.blendByte(previous: previous[index + 1], current: rgba[index + 1], currentWeight: currentWeight)
+            output[index + 2] = Self.blendByte(previous: previous[index + 2], current: rgba[index + 2], currentWeight: currentWeight)
+
+            if alphaDelta < 0.035 {
+                output[index + 3] = Self.blendByte(previous: previousAlpha, current: currentAlpha, currentWeight: max(currentWeight, 0.82))
+            } else {
+                output[index + 3] = currentAlpha
+            }
+        }
+
+        previousTextureRGBA = output
+        previousTextureWidth = pixelWidth
+        previousTextureHeight = pixelHeight
+        previousTextureColor = color
+        return output
+    }
+
     private static func blendChannel(original: UInt8, blurred: UInt8, amount: Float) -> UInt8 {
         let mixed = Float(original) + (Float(blurred) - Float(original)) * amount
         return UInt8(max(0, min(mixed.rounded(), 255)))
+    }
+
+    private static func blendByte(previous: UInt8, current: UInt8, currentWeight: Float) -> UInt8 {
+        let weight = max(0, min(currentWeight, 1))
+        let mixed = Float(previous) + (Float(current) - Float(previous)) * weight
+        return UInt8(max(0, min(mixed.rounded(), 255)))
+    }
+
+    private static func colorDistance(_ first: RGBColor, _ second: RGBColor) -> Float {
+        max(abs(first.red - second.red), max(abs(first.green - second.green), abs(first.blue - second.blue)))
     }
 
     private static func matteLipColor(from color: UIColor) -> UIColor {
@@ -2311,6 +2809,10 @@ private final class LipTextureRenderer {
         return x * x * (3 - 2 * x)
     }
 
+    private static func clamp01(_ value: Float) -> Float {
+        max(0, min(value, 1))
+    }
+
     private static func valueNoise(x: Int, y: Int) -> Float {
         var value = UInt32(truncatingIfNeeded: x) &* 374_761_393
         value = value &+ UInt32(truncatingIfNeeded: y) &* 668_265_263
@@ -2332,6 +2834,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private let textureQueue = DispatchQueue(label: "VirtualMakeup.LipTexture", qos: .userInteractive)
     private let lipTextureRenderer = LipTextureRenderer()
     private let lipMeshRenderer = LipMeshRenderer()
+    private let arRendererFPS = FPSMeter("ar_renderer")
+    private let mediaPipeFPS = FPSMeter("mediapipe_result")
+    private let textureFPS = FPSMeter("lip_texture")
     private let viewportLock = NSLock()
     private let detectionLock = NSLock()
     private let trackingLock = NSLock()
@@ -2363,6 +2868,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private var latestMeshContourTime: CFTimeInterval?
     private var latestMeshMotionPose: LipMotionPose?
     private var latestLipTexture: LipTexture?
+    private var lastTextureMouthOpen: Bool?
     private var lastLoggedMediaPipeLandmarkCount: Int?
     private var neutralMouthWidth: Float?
 
@@ -2376,9 +2882,10 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private static let maxMotionCompensationAge: CFTimeInterval = 0.16
     private static let maxDisplayedTextureTrackingAge: CFTimeInterval = 0.36
     private static let maxPendingLiveFrameAge: CFTimeInterval = 0.8
-    private static let minTextureRenderInterval: CFTimeInterval = 0.045
-    private static let lipMeshVerticalAlignmentOffset: Float = 0.045
-    private static let maxLipMeshVerticalAlignment: Float = 0.0022
+    private static let minTextureRenderInterval: CFTimeInterval = 0.033
+    private static let minLowLatencyTextureRenderInterval: CFTimeInterval = 0.020
+    private static let lipMeshVerticalAlignmentOffset: Float = 0.026
+    private static let maxLipMeshVerticalAlignment: Float = 0.00135
 
     init(isFaceDetected: Binding<Bool>) {
         _isFaceDetected = isFaceDetected
@@ -2393,7 +2900,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }
 
         let configuration = ARFaceTrackingConfiguration()
-        configuration.isLightEstimationEnabled = true
+        configuration.isLightEstimationEnabled = false
         sceneView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -2404,7 +2911,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     }
 
     func updateColors(_ color: UIColor) {
-        lipTextureRenderer.updateColor(color)
+        guard lipTextureRenderer.updateColor(color) else {
+            return
+        }
+        invalidatePendingTextures()
+        clearLatestLipTexture()
     }
 
     func updateViewport(size: CGSize, scale: CGFloat) {
@@ -2431,6 +2942,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        let frameStart = CACurrentMediaTime()
+        defer {
+            arRendererFPS.tick(workMilliseconds: (CACurrentMediaTime() - frameStart) * 1000)
+        }
+
         guard let faceAnchor = anchor as? ARFaceAnchor else {
             return
         }
@@ -2456,7 +2972,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
                 renderer: renderer,
                 faceNode: node,
                 contourAge: meshState.contourAge,
-                motionDelta: meshState.motionDelta
+                motionDelta: meshState.motionDelta,
+                openingScale: meshState.openingScale
             )
             } else {
                 let availability = currentLipMeshAvailability()
@@ -2572,6 +3089,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let imageSize: CGSize
         let viewportSize: CGSize
         let renderScale: CGFloat
+        let excludesInnerMouth: Bool
         let lowLatency: Bool
         let generation: Int
         let requestID: Int
@@ -2583,6 +3101,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let texture: LipTexture
         let contourAge: CFTimeInterval
         let motionDelta: CGFloat
+        let openingScale: Float
     }
 
     private func submitLiveStreamFrame(pixelBuffer: CVPixelBuffer,
@@ -2645,6 +3164,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private func handleLiveStreamResult(_ result: FaceLandmarkerResult?,
                                         timestampInMilliseconds: Int,
                                         error: Error?) {
+        let resultStart = CACurrentMediaTime()
+        defer {
+            mediaPipeFPS.tick(workMilliseconds: (CACurrentMediaTime() - resultStart) * 1000)
+        }
+
         guard let frame = pendingLiveFrames.removeValue(forKey: timestampInMilliseconds) else {
             return
         }
@@ -2749,8 +3273,10 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             "lip_detection accept lowLatency=\(lowLatencyShapeChange) \(lipContourDebugSummary(stableContour))"
         )
 
-        guard shouldSubmitTextureRender(
-            lowLatency: lowLatencyShapeChange,
+        let mouthOpenForTexture = textureMouthOpenState(for: mouthOpeningRatio(stableContour))
+        guard shouldSubmitStableTextureRender(
+            mouthOpen: mouthOpenForTexture,
+            hasTexture: currentLipMeshAvailability().texture,
             now: CACurrentMediaTime()
         ) else {
             return
@@ -2762,7 +3288,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             imageSize: detection.imageSize,
             viewportSize: frame.viewportSize,
             renderScale: frame.renderScale,
-            lowLatency: lowLatencyShapeChange,
+            excludesInnerMouth: mouthOpenForTexture,
+            lowLatency: false,
             generation: currentTextureGeneration(),
             requestID: reserveTextureRequestID(),
             motionReference: motionReference
@@ -2888,8 +3415,14 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             currentPose.center.x - expectedPose.center.x,
             currentPose.center.y - expectedPose.center.y
         ) / max(min(viewportSize.width, viewportSize.height), 1)
+        let previousOpening = smoothedLipContour.map { mouthOpeningRatio($0) } ?? 0
+        let currentOpening = mouthOpeningRatio(contour)
+        let openingDelta = abs(currentOpening - previousOpening)
 
-        if widthRatio < 0.50 || widthRatio > 1.95 {
+        if widthRatio < 0.62 || widthRatio > 1.38 {
+            return false
+        }
+        if widthRatio > 1.24 && openingDelta > 0.055 {
             return false
         }
         if centerDistance > 0.92 || viewportDrift > 0.24 {
@@ -2991,6 +3524,17 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             scaleDelta * 0.65 +
             angleDelta * 0.35 +
             openingDelta * 1.45
+    }
+
+    private func openingScale(from source: LipMotionPose?, to target: LipMotionPose?) -> Float {
+        guard let source, let target else {
+            return 1
+        }
+
+        let sourceOpening = max(source.opening, 0.035)
+        let targetOpening = max(target.opening, 0.035)
+        let rawScale = Float(targetOpening / sourceOpening)
+        return min(max(rawScale, 0.74), 1.34)
     }
 
     private static func normalizedAngle(_ angle: CGFloat) -> CGFloat {
@@ -3116,22 +3660,55 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             textureStateLock.unlock()
         }
 
-        if lowLatency {
+        let minimumInterval = lowLatency ?
+            Self.minLowLatencyTextureRenderInterval :
+            Self.minTextureRenderInterval
+
+        guard let lastTextureSubmitTime else {
             lastTextureSubmitTime = now
             return true
         }
 
-        guard let lastTextureSubmitTime else {
-            self.lastTextureSubmitTime = now
-            return true
-        }
-
-        guard now - lastTextureSubmitTime >= Self.minTextureRenderInterval else {
+        guard now - lastTextureSubmitTime >= minimumInterval else {
             return false
         }
 
         self.lastTextureSubmitTime = now
         return true
+    }
+
+    private func shouldSubmitStableTextureRender(mouthOpen: Bool,
+                                                 hasTexture: Bool,
+                                                 now: CFTimeInterval) -> Bool {
+        textureStateLock.lock()
+        defer {
+            textureStateLock.unlock()
+        }
+
+        if isRenderingTexture {
+            return false
+        }
+
+        guard hasTexture,
+              lastTextureMouthOpen == mouthOpen else {
+            lastTextureMouthOpen = mouthOpen
+            lastTextureSubmitTime = now
+            return true
+        }
+
+        return false
+    }
+
+    private func textureMouthOpenState(for opening: CGFloat) -> Bool {
+        textureStateLock.lock()
+        let previous = lastTextureMouthOpen
+        textureStateLock.unlock()
+
+        if let previous {
+            return previous ? opening > 0.105 : opening > 0.185
+        }
+
+        return opening > 0.150
     }
 
     private func isTextureRenderInFlight() -> Bool {
@@ -3142,14 +3719,17 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     }
 
     private func renderTextureRequest(_ request: LipTextureRequest) {
+        let textureStart = CACurrentMediaTime()
         let texture = lipTextureRenderer.makeTexture(
             contour: request.contour,
             pixelBuffer: request.pixelBuffer,
             imageSize: request.imageSize,
             viewportSize: request.viewportSize,
             renderScale: request.renderScale,
+            excludesInnerMouth: request.excludesInnerMouth,
             lowLatency: request.lowLatency
         )
+        textureFPS.tick(workMilliseconds: (CACurrentMediaTime() - textureStart) * 1000)
 
         let isTracked = currentTrackedFaceAnchor()
         let hasFreshShape = hasFreshLipShape()
@@ -3370,6 +3950,12 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let widthChange = abs(currentBounds.width / previousBounds.width - 1)
         let heightChange = abs(currentBounds.height / previousBounds.height - 1)
         let openingChange = abs(mouthOpeningRatio(current) - mouthOpeningRatio(previous))
+        let widthRatio = currentBounds.width / max(previousBounds.width, 1)
+        let heightRatio = currentBounds.height / max(previousBounds.height, 1)
+
+        if widthRatio > 1.20 || heightRatio > 1.26 {
+            return false
+        }
 
         return widthChange > 0.065 ||
             heightChange > 0.090 ||
@@ -3398,8 +3984,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         ) / max(currentPose.width, 1)
         let scaleMotion = abs(currentPose.width - previousPose.width) / max(previousPose.width, 1)
         let angleMotion = abs(currentPose.angle - previousPose.angle)
-        let motion = centerMotion * 1.6 + scaleMotion + angleMotion * 0.8
-        return min(max(0.94 + motion * 1.6, 0.94), 0.99)
+        let openingMotion = smoothedLipContour.map {
+            abs(mouthOpeningRatio(contour) - mouthOpeningRatio($0))
+        } ?? 0
+        let motion = centerMotion * 1.6 + scaleMotion + angleMotion * 0.8 + openingMotion * 2.2
+        return min(max(0.72 + motion * 6.2, 0.72), 0.985)
     }
 
     private func smooth(previous: CGPoint, current: CGPoint, alpha: CGFloat) -> CGPoint {
@@ -3486,17 +4075,31 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             normalAxis = -normalAxis
         }
 
-        let verticalAlignment = min(
-            referenceWidth * Self.lipMeshVerticalAlignmentOffset,
-            Self.maxLipMeshVerticalAlignment
-        )
-        let center = (left + right + top + bottom) * 0.25 +
-            downAxis * verticalAlignment
+        let verticalAlignment: Float = 0
+        let center = (left + right + top + bottom) * 0.25
         guard center.x.isFinite,
               center.y.isFinite,
               center.z.isFinite else {
             return nil
         }
+
+        let blendShapes = faceAnchor.blendShapes
+        let jawOpen = max(
+            Float(openingRatio),
+            FaceBlendShapeValue.value(.jawOpen, in: blendShapes)
+        )
+        let smileLeft = max(
+            FaceBlendShapeValue.value(.mouthSmileLeft, in: blendShapes),
+            FaceBlendShapeValue.value(.mouthDimpleLeft, in: blendShapes) * 0.55
+        )
+        let smileRight = max(
+            FaceBlendShapeValue.value(.mouthSmileRight, in: blendShapes),
+            FaceBlendShapeValue.value(.mouthDimpleRight, in: blendShapes) * 0.55
+        )
+        let upperLipRaise = max(
+            FaceBlendShapeValue.value(.mouthUpperUpLeft, in: blendShapes),
+            FaceBlendShapeValue.value(.mouthUpperUpRight, in: blendShapes)
+        )
 
         return FaceLocalMouthFrame(
             center: center,
@@ -3507,7 +4110,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             smileExpansion: smileExpansion,
             openingRatio: openingRatio,
             referenceWidth: referenceWidth,
-            verticalAlignment: verticalAlignment
+            verticalAlignment: verticalAlignment,
+            jawOpen: jawOpen,
+            smileLeft: smileLeft,
+            smileRight: smileRight,
+            upperLipRaise: upperLipRaise
         )
     }
 
@@ -3548,18 +4155,10 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             return point
         }
 
-        let faceScaleBasis = projectedFaceScaleBasis(
-            vertices: vertices,
-            faceTransform: faceAnchor.transform,
-            renderer: renderer,
-            extendedViewport: extendedViewport
-        )
-
         guard let left = projectedPoint(for: Self.arKitMouthLeftIndex),
               let right = projectedPoint(for: Self.arKitMouthRightIndex),
               let top = projectedPoint(for: Self.arKitMouthTopIndex),
-              let bottom = projectedPoint(for: Self.arKitMouthBottomIndex),
-              let faceScaleBasis else {
+              let bottom = projectedPoint(for: Self.arKitMouthBottomIndex) else {
             return nil
         }
 
@@ -3567,46 +4166,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             left: left,
             right: right,
             top: top,
-            bottom: bottom,
-            scaleBasis: faceScaleBasis
+            bottom: bottom
         )
-    }
-
-    private func projectedFaceScaleBasis(vertices: [vector_float3],
-                                         faceTransform: simd_float4x4,
-                                         renderer: SCNSceneRenderer,
-                                         extendedViewport: CGRect) -> CGFloat? {
-        var xValues: [CGFloat] = []
-        xValues.reserveCapacity(vertices.count)
-
-        for vertex in vertices {
-            let world = faceTransform * SIMD4<Float>(vertex.x, vertex.y, vertex.z, 1)
-            let projected = renderer.projectPoint(SCNVector3(world.x, world.y, world.z))
-            let point = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
-            guard point.x.isFinite,
-                  point.y.isFinite,
-                  projected.z.isFinite,
-                  projected.z >= 0,
-                  projected.z <= 1,
-                  extendedViewport.contains(point) else {
-                continue
-            }
-            xValues.append(point.x)
-        }
-
-        guard xValues.count >= 40 else {
-            return nil
-        }
-
-        xValues.sort()
-        let inset = max(xValues.count / 20, 1)
-        let low = xValues[inset]
-        let high = xValues[xValues.count - inset - 1]
-        let width = high - low
-        guard width.isFinite, width > 12 else {
-            return nil
-        }
-        return width
     }
 
     private func beginDetection(timestampInMilliseconds: Int) -> Bool {
@@ -3709,23 +4270,48 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         meshStateLock.unlock()
     }
 
+    private func clearLatestLipTexture() {
+        meshStateLock.lock()
+        latestLipTexture = nil
+        meshStateLock.unlock()
+
+        textureStateLock.lock()
+        lastTextureMouthOpen = nil
+        lastTextureSubmitTime = nil
+        textureStateLock.unlock()
+    }
+
     private func currentLipMeshState() -> LipMeshState? {
         meshStateLock.lock()
         let contour = latestMeshContour
         let contourTime = latestMeshContourTime
         let contourMotionPose = latestMeshMotionPose
         let texture = latestLipTexture
-        let currentMotionPose = latestLipMotionPose
         meshStateLock.unlock()
+        let currentMotionPose = currentLipMotionPose()
 
         guard let contour, let texture else {
             return nil
         }
+        let contourAge = contourTime.map { CACurrentMediaTime() - $0 } ?? .greatestFiniteMagnitude
+        let motionDelta = motionDelta(from: contourMotionPose, to: currentMotionPose)
+        let openingScale = openingScale(from: contourMotionPose, to: currentMotionPose)
+        let renderedContour: LipContour
+        if let contourMotionPose,
+           let currentMotionPose,
+           motionDelta < 0.55,
+           contourAge <= Self.maxDisplayedTextureTrackingAge {
+            renderedContour = contour.transformed(from: contourMotionPose, to: currentMotionPose)
+        } else {
+            renderedContour = contour
+        }
+
         return LipMeshState(
-            contour: contour,
+            contour: renderedContour,
             texture: texture,
-            contourAge: contourTime.map { CACurrentMediaTime() - $0 } ?? .greatestFiniteMagnitude,
-            motionDelta: motionDelta(from: contourMotionPose, to: currentMotionPose)
+            contourAge: contourAge,
+            motionDelta: motionDelta,
+            openingScale: openingScale
         )
     }
 
@@ -3742,7 +4328,6 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         latestMeshContour = nil
         latestMeshContourTime = nil
         latestMeshMotionPose = nil
-        latestLipTexture = nil
         meshStateLock.unlock()
     }
 
@@ -3757,7 +4342,6 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         clearLipShapeFreshness()
         setLatestLipMotionPose(nil)
         clearLipMeshState()
-        invalidatePendingTextures()
     }
 
     private func resetLipTrackingAsync() {
