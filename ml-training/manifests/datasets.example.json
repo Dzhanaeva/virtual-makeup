@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "name": "internal-consented-lip-videos-v1",
+      "root": "/absolute/path/to/internal-dataset",
+      "samples_index": "samples.jsonl",
+      "owner": "Your Company",
+      "license_id": "Proprietary-Internal",
+      "commercial_use_approved": true,
+      "annotation_use_approved": true,
+      "consent_basis": "Document the signed release or other reviewed basis",
+      "approved_by": "Legal reviewer name",
+      "approved_at": "YYYY-MM-DD",
+      "notes": "Replace this example before training"
+    }
+  ]
+}
+

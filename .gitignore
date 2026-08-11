@@ -1,3 +1,8 @@
 Pods/
 Pods/
 Pods/
+ml-training/.venv/
+ml-training/data/
+ml-training/artifacts/
+ml-training/**/*.pyc
+ml-training/**/__pycache__/

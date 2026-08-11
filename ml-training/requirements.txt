@@ -1,0 +1,5 @@
+numpy>=1.26,<3
+Pillow>=10,<12
+torch>=2.3,<3
+coremltools>=8,<10
+

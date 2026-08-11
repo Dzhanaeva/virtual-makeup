@@ -1,0 +1,20 @@
+{
+  "input_width": 192,
+  "input_height": 96,
+  "class_count": 4,
+  "class_names": [
+    "background",
+    "upper_lip",
+    "lower_lip",
+    "inner_mouth"
+  ],
+  "roi_margin_x": 0.22,
+  "roi_margin_y": 0.34,
+  "split_seed": "virtual-makeup-lip-roi-v1",
+  "splits": {
+    "train": 0.8,
+    "validation": 0.1,
+    "test": 0.1
+  }
+}
+
