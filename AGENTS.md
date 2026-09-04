@@ -19,22 +19,34 @@ Current core technologies:
 - `UIViewRepresentable` bridge for `ARSCNView`.
 - ARKit face tracking and SceneKit rendering for camera, face anchor, occlusion, and lip mesh.
 - MediaPipe Tasks Vision `FaceLandmarker` for live lip landmark detection.
+- Metal and Metal Performance Shaders for camera-aware lipstick colour, texture preservation,
+  and the feathered lip alpha mask; the legacy CPU compositor is fallback-only.
 - CocoaPods for `MediaPipeTasksVision`.
-- Bundled model/assets: `face_landmarker.task`, `faceParsing.mlmodel`, `face_model_with_iris.obj`,
-  and `Assets.xcassets`.
+- Bundled model/assets: `face_landmarker.task`, `face_model_with_iris.obj`, and
+  `Assets.xcassets`.
+- `ml-training/` for an optional future commercial-safe, lip-only CoreML model training and
+  export workflow. No CoreML segmentation model is currently bundled or executed at runtime.
 
 ## Important files
 
 - `Virtual Makeup/Virtual_MakeupApp.swift`: SwiftUI app entry point.
 - `Virtual Makeup/ContentView.swift`: top-level UI, face detection status, and lipstick presets.
-- `Virtual Makeup/FaceTrackingView.swift`: AR view bridge, MediaPipe live stream handling,
-  lip contour processing, smoothing, texture generation, and SceneKit mesh rendering.
+- `Virtual Makeup/FaceTrackingView.swift`: thin SwiftUI/`ARSCNView` bridge.
+- `Virtual Makeup/FaceTrackingCoordinator.swift`: ARKit and MediaPipe callback orchestration,
+  tracking state, smoothing, prediction, and render request scheduling.
+- `Virtual Makeup/LipModels.swift` and `CanonicalLipGeometry.swift`: lip/face geometry data,
+  coordinate transforms, canonical topology, and mesh lookup data.
+- `Virtual Makeup/LipMeshRenderer.swift`, `LipTextureRenderer.swift`, and
+  `MetalLipColorCompositor.swift`: SceneKit geometry and camera-aware lipstick rendering.
+- `Virtual Makeup/BlushRenderer.swift`: SceneKit blush rendering.
 - `Virtual Makeup/VirtualMakeup-Bridging-Header.h`: Objective-C bridging header configured in
   the Xcode project.
 - `Virtual-Makeup-Info.plist`: app Info.plist, including camera permission text.
 - `Podfile` and `Podfile.lock`: CocoaPods dependency definition and lockfile.
 - `Virtual Makeup.xcworkspace`: preferred Xcode entry point when CocoaPods are installed.
 - `Virtual Makeup.xcodeproj`: app project settings and target configuration.
+- `ml-training/README.md`: lip-only model contract and training workflow.
+- `ml-training/COMMERCIAL_DATA_POLICY.md`: required provenance rules for training data and weights.
 
 Do not manually edit generated CocoaPods files under `Pods/`. Change `Podfile`, then run
 `pod install` and keep generated project files consistent with the repository's chosen
@@ -57,9 +69,16 @@ xcodebuild -workspace "Virtual Makeup.xcworkspace" -scheme "Virtual Makeup" -des
 This app depends on camera and AR face tracking behavior. Simulator builds can catch compile
 errors, but meaningful validation requires a real device that supports `ARFaceTrackingConfiguration`.
 
-There is currently no dedicated test target. When extracting pure logic from
-`FaceTrackingView.swift` into smaller units, add focused tests for deterministic geometry,
-color, smoothing, and texture math.
+There is currently no dedicated test target. When extracting pure logic from the tracking,
+geometry, or rendering units, add focused tests for deterministic geometry, color, smoothing,
+and texture math.
+
+For the lip-only CoreML training utilities:
+
+```sh
+python3 -m compileall ml-training
+python3 ml-training/scripts/smoke_test.py
+```
 
 ## Architecture guidelines
 
@@ -101,6 +120,8 @@ color, smoothing, and texture math.
   space, UV space, AR face local space, and SceneKit space should not be mixed implicitly.
 - Do not regenerate high-cost textures more often than necessary. Preserve low-latency throttling
   and superseded-request checks when changing texture rendering.
+- Keep the Metal lip target compact, retain source `CVMetalTexture` objects until command-buffer
+  completion, and preserve the failure-counted CPU fallback when changing the compositor.
 - Clear SceneKit nodes and tracking state when anchors are removed, sessions stop, tracking is lost,
   or detection becomes stale.
 
@@ -114,6 +135,12 @@ color, smoothing, and texture math.
   effect of unrelated work.
 - Current project settings show an iOS deployment target of `18.0`; the `Podfile` declares
   `platform :ios, '15.0'`. If deployment support is changed, reconcile both intentionally.
+- Treat `ml-training/data/` and `ml-training/artifacts/` as local-only by default. Do not commit
+  face images, masks, checkpoints, or exported models until dataset rights and distribution terms
+  are reviewed for the commercial product.
+- Do not use CelebAMask-HQ, weights trained on CelebAMask-HQ, unknown-license datasets, or scraped
+  images in production training. Every training source must pass the checked-in commercial manifest
+  validation.
 
 ## Change workflow
 

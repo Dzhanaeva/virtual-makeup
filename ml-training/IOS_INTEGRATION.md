@@ -1,7 +1,8 @@
 # iOS Integration Contract
 
-Do not replace the existing `faceParsing.mlmodel` runtime until a reviewed
-`LipSegmentation.mlpackage` has passed the device acceptance checks below.
+No CoreML segmentation model is currently bundled or executed by the app.
+Do not add `LipSegmentation.mlpackage` to the runtime until it has passed the
+review and device acceptance checks below.
 
 ## Runtime Input
 

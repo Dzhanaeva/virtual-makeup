@@ -31,10 +31,8 @@ Permissively licensed source code may be reviewed as an architectural reference.
 Do not assume that a repository license automatically grants commercial rights
 to bundled datasets or pretrained weights. Record those artifacts separately.
 
-## Existing Runtime Model
+## Removed Legacy Model
 
-The bundled `Virtual Makeup/faceParsing.mlmodel` is not an approved training
-source for the new model. Its origin, source dataset, redistribution terms, and
-commercial-use rights must be documented before it can ship in a commercial
-build. Remove it from production once the reviewed lip-only model replaces its
-runtime role, unless it has a separate reviewed use case.
+The legacy `faceParsing.mlmodel` was removed because its origin, source dataset,
+redistribution terms, and commercial-use rights were not documented. Do not
+reintroduce it or use it as a training source for a new model.
