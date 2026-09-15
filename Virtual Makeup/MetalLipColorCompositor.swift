@@ -11,10 +11,14 @@ import UIKit
 struct LipTexture {
     let image: UIImage
     let opacityImage: UIImage
+    let linerOpacityImage: UIImage?
 
-    init(image: UIImage, opacityImage: UIImage? = nil) {
+    init(image: UIImage,
+         opacityImage: UIImage? = nil,
+         linerOpacityImage: UIImage? = nil) {
         self.image = image
         self.opacityImage = opacityImage ?? image
+        self.linerOpacityImage = linerOpacityImage
     }
 }
 
@@ -35,18 +39,36 @@ final class MetalLipColorCompositor {
         var sourceTexelSize: SIMD2<Float>
         var lightingFactor: Float
         var detailStrength: Float
+        var diffuseLightResponse: Float
         var coreCoverage: Float
         var highlightStrength: Float
         var highlightMaximum: Float
         var highlightConcentration: Float
         var finish: Float
         var apertureClosure: Float
+        var naturalLipColorWeight: Float
+        var shadowRetention: Float
+        var shineMaskMinimum: Float
+        var shineMaskMaximum: Float
+        var referenceLipLuminance: Float
+        var capturedShadowMaximumStops: Float
+        var capturedDiffuseLightMaximumStops: Float
+        var shadingDebugMode: Float
     }
 
-    private struct FinishParameters {
-        let detailStrength: Float
-        let highlightStrength: Float
-        let highlightMaximum: Float
+    private struct ShineTemporalUniforms {
+        var riseCurrentWeight: Float
+        var releaseCurrentWeight: Float
+        var historyValid: Float
+        var padding: Float = 0
+    }
+
+    private struct ShineGeometryUniforms {
+        var textureSize: SIMD2<Float>
+        var outerPointCount: UInt32
+        var innerPointCount: UInt32
+        var finish: Float
+        var padding: Float = 0
     }
 
     private struct FeatherUniforms {
@@ -59,12 +81,18 @@ final class MetalLipColorCompositor {
         var apertureMouthFeatherPixels: Float
         var apertureInsetPixels: Float
         var apertureClosure: Float
+        var finish: Float
     }
 
     private struct RenderTargets {
         let width: Int
         let height: Int
         let color: MTLTexture
+        let currentShine: MTLTexture
+        let stabilizedShine: MTLTexture
+        let gatedShine: MTLTexture
+        let shineHistory: MTLTexture
+        let shadedColor: MTLTexture
         let output: MTLTexture
         let horizontalBlur: MTLTexture
         let softenedOutput: MTLTexture
@@ -76,6 +104,9 @@ final class MetalLipColorCompositor {
         let commandQueue: MTLCommandQueue
         let textureCache: CVMetalTextureCache
         let renderPipeline: MTLRenderPipelineState
+        let shineTemporalPipeline: MTLComputePipelineState
+        let shineGeometryPipeline: MTLComputePipelineState
+        let shineApplyPipeline: MTLComputePipelineState
         let compositePipeline: MTLComputePipelineState
         let alphaBlurHorizontalPipeline: MTLComputePipelineState
         let alphaBlurVerticalPipeline: MTLComputePipelineState
@@ -87,6 +118,9 @@ final class MetalLipColorCompositor {
              commandQueue: MTLCommandQueue,
              textureCache: CVMetalTextureCache,
              renderPipeline: MTLRenderPipelineState,
+             shineTemporalPipeline: MTLComputePipelineState,
+             shineGeometryPipeline: MTLComputePipelineState,
+             shineApplyPipeline: MTLComputePipelineState,
              compositePipeline: MTLComputePipelineState,
              alphaBlurHorizontalPipeline: MTLComputePipelineState,
              alphaBlurVerticalPipeline: MTLComputePipelineState,
@@ -96,6 +130,9 @@ final class MetalLipColorCompositor {
             self.commandQueue = commandQueue
             self.textureCache = textureCache
             self.renderPipeline = renderPipeline
+            self.shineTemporalPipeline = shineTemporalPipeline
+            self.shineGeometryPipeline = shineGeometryPipeline
+            self.shineApplyPipeline = shineApplyPipeline
             self.compositePipeline = compositePipeline
             self.alphaBlurHorizontalPipeline = alphaBlurHorizontalPipeline
             self.alphaBlurVerticalPipeline = alphaBlurVerticalPipeline
@@ -118,18 +155,47 @@ final class MetalLipColorCompositor {
         float2 sourceTexelSize;
         float lightingFactor;
         float detailStrength;
+        float diffuseLightResponse;
         float coreCoverage;
         float highlightStrength;
         float highlightMaximum;
         float highlightConcentration;
         float finish;
         float apertureClosure;
+        float naturalLipColorWeight;
+        float shadowRetention;
+        float shineMaskMinimum;
+        float shineMaskMaximum;
+        float referenceLipLuminance;
+        float capturedShadowMaximumStops;
+        float capturedDiffuseLightMaximumStops;
+        float shadingDebugMode;
+    };
+
+    struct LipShineTemporalUniforms {
+        float riseCurrentWeight;
+        float releaseCurrentWeight;
+        float historyValid;
+        float padding;
+    };
+
+    struct LipShineGeometryUniforms {
+        float2 textureSize;
+        uint outerPointCount;
+        uint innerPointCount;
+        float finish;
+        float padding;
     };
 
     struct LipRaster {
         float4 position [[position]];
         float2 sourceUV;
         float2 canonicalUV;
+    };
+
+    struct LipFragmentOutput {
+        float4 material [[color(0)]];
+        float shine [[color(1)]];
     };
 
     struct LipFeatherUniforms {
@@ -142,6 +208,7 @@ final class MetalLipColorCompositor {
         float apertureMouthFeatherPixels;
         float apertureInsetPixels;
         float apertureClosure;
+        float finish;
     };
 
     vertex LipRaster lip_vertex(const device LipVertex *vertices [[buffer(0)]],
@@ -160,8 +227,40 @@ final class MetalLipColorCompositor {
         return output;
     }
 
-    float lip_luminance(float3 color) {
-        return clamp(dot(color, float3(0.299, 0.587, 0.114)), 0.0, 1.0);
+    float3 lip_srgb_to_linear(float3 color) {
+        color = saturate(color);
+        float3 low = color / 12.92;
+        float3 high = pow(
+            (color + 0.055) / 1.055,
+            float3(2.4)
+        );
+        return select(low, high, color > 0.04045);
+    }
+
+    float3 lip_linear_to_srgb(float3 color) {
+        color = max(color, 0.0);
+        float3 low = color * 12.92;
+        float3 high = 1.055 * pow(
+            color,
+            float3(1.0 / 2.4)
+        ) - 0.055;
+        return saturate(select(low, high, color > 0.0031308));
+    }
+
+    float lip_luminance(float3 linearColor) {
+        return clamp(
+            dot(linearColor, float3(0.2126, 0.7152, 0.0722)),
+            0.0,
+            1.0
+        );
+    }
+
+    float lip_perceptual_luma(float3 srgbColor) {
+        return clamp(
+            dot(srgbColor, float3(0.299, 0.587, 0.114)),
+            0.0,
+            1.0
+        );
     }
 
     float lip_saturation(float3 color) {
@@ -170,9 +269,40 @@ final class MetalLipColorCompositor {
         return maximum > 0.001 ? (maximum - minimum) / maximum : 0.0;
     }
 
-    float lip_tooth_probability(float3 color) {
-        float luminance = lip_luminance(color);
-        float saturation = lip_saturation(color);
+    float2 lip_hsv_hue_saturation(float3 color) {
+        float maximum = max(color.r, max(color.g, color.b));
+        float minimum = min(color.r, min(color.g, color.b));
+        float delta = maximum - minimum;
+        float2 result = float2(0.0);
+        if (delta > 0.0001 && maximum > 0.0001) {
+            result.y = delta / maximum;
+            if (maximum == color.r) {
+                result.x = (color.g - color.b) / delta;
+            } else if (maximum == color.g) {
+                result.x = 2.0 + (color.b - color.r) / delta;
+            } else {
+                result.x = 4.0 + (color.r - color.g) / delta;
+            }
+            result.x = fract(result.x / 6.0);
+        }
+        return result;
+    }
+
+    float3 lip_hsv_to_rgb(float hue, float saturation, float value) {
+        float3 hueOffsets = float3(1.0, 2.0 / 3.0, 1.0 / 3.0);
+        float3 channels = clamp(
+            abs(fract(hueOffsets + hue) * 6.0 - 3.0) - 1.0,
+            0.0,
+            1.0
+        );
+        return value * mix(float3(1.0), channels, saturation);
+    }
+
+    float lip_tooth_probability(float3 srgbColor) {
+        // Tooth classification is perceptual rather than a lighting operation,
+        // so preserve its camera-space thresholds while shading stays linear.
+        float luminance = lip_perceptual_luma(srgbColor);
+        float saturation = lip_saturation(srgbColor);
         float bright = smoothstep(0.64, 0.82, luminance);
         float lowSaturation = 1.0 - smoothstep(0.16, 0.30, saturation);
         return bright * lowSaturation;
@@ -188,33 +318,46 @@ final class MetalLipColorCompositor {
         return saturate(adjusted);
     }
 
-    float lip_irregular_glint(float2 local, float falloff, float phase) {
-        float distanceSquared = dot(local, local);
-        float edgeWeight = smoothstep(0.16, 0.92, distanceSquared);
-        float edgeVariation =
-            sin(local.x * 9.7 + local.y * 6.1 + phase) * 0.055 +
-            sin(local.x * 17.3 - local.y * 11.9 + phase * 1.7) * 0.030;
-        return pow(
-            saturate(1.0 - distanceSquared + edgeVariation * edgeWeight),
-            falloff
+    float lip_captured_shape_exposure(
+        float localLuminance,
+        float pigmentLuminance,
+        constant LipUniforms &uniforms
+    ) {
+        if (uniforms.referenceLipLuminance <= 0.0045 ||
+            localLuminance <= 0.0) {
+            return 0.0;
+        }
+
+        float palePigment = smoothstep(0.16, 0.38, pigmentLuminance);
+        float denseCoverage = smoothstep(0.68, 0.92, uniforms.coreCoverage);
+        float paleDenseAmount = palePigment * denseCoverage;
+        float capturedExposure = log2(
+            max(localLuminance, 0.0031) /
+            max(uniforms.referenceLipLuminance, 0.0045)
         );
+        if (capturedExposure < 0.0) {
+            float maximumShadowStops = mix(
+                0.92,
+                uniforms.capturedShadowMaximumStops,
+                paleDenseAmount
+            );
+            float shadowRetention = mix(
+                saturate(uniforms.shadowRetention),
+                max(saturate(uniforms.shadowRetention), 0.98),
+                paleDenseAmount
+            );
+            return max(capturedExposure, -maximumShadowStops) *
+                shadowRetention;
+        }
+
+        float maximumDiffuseStops =
+            uniforms.capturedDiffuseLightMaximumStops *
+            mix(1.0, 0.72, paleDenseAmount);
+        return min(capturedExposure, maximumDiffuseStops) *
+            uniforms.diffuseLightResponse;
     }
 
-    float2 lip_rotated_local(float2 point,
-                             float2 center,
-                             float2 radii,
-                             float angle) {
-        float2 delta = point - center;
-        float cosine = cos(angle);
-        float sine = sin(angle);
-        float2 aligned = float2(
-            delta.x * cosine + delta.y * sine,
-            -delta.x * sine + delta.y * cosine
-        );
-        return aligned / radii;
-    }
-
-    fragment float4 lip_fragment(
+    fragment LipFragmentOutput lip_fragment(
         LipRaster input [[stage_in]],
         constant LipUniforms &uniforms [[buffer(0)]],
         texture2d<float> cameraTexture [[texture(0)]]) {
@@ -224,262 +367,285 @@ final class MetalLipColorCompositor {
             filter::linear
         );
 
-        float2 radius = uniforms.sourceTexelSize * 5.0;
-        float3 base = cameraTexture.sample(cameraSampler, input.sourceUV).rgb;
-        float3 blurred = base * 4.0;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV + float2(radius.x, 0.0)).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV - float2(radius.x, 0.0)).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV + float2(0.0, radius.y)).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV - float2(0.0, radius.y)).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV + radius).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV - radius).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV + float2(radius.x, -radius.y)).rgb;
-        blurred += cameraTexture.sample(cameraSampler, input.sourceUV + float2(-radius.x, radius.y)).rgb;
-        blurred /= 12.0;
-
-        // Use the camera's real reflection pattern as the satin highlight.
+        float3 baseSRGB = cameraTexture.sample(
+            cameraSampler,
+            input.sourceUV
+        ).rgb;
+        float3 base = lip_srgb_to_linear(baseSRGB);
+        // Adapted from Banuba beauty-ios matt.frag (MIT) as the diffuse base
+        // of every finish: product hue/saturation plus per-pixel camera value.
+        // HSV stays in display RGB, then returns to linear RGB for blending.
+        float cameraValue = max(
+            baseSRGB.r,
+            max(baseSRGB.g, baseSRGB.b)
+        );
+        float3 lipstickSRGB = saturate(uniforms.lipstickColor.rgb);
+        float lipstickValue = max(
+            lipstickSRGB.r,
+            max(lipstickSRGB.g, lipstickSRGB.b)
+        );
+        float targetValue = saturate(
+            cameraValue * lipstickValue / 0.85
+        );
+        float2 lipstickHS = lip_hsv_hue_saturation(lipstickSRGB);
+        float3 cameraAwarePigment = lip_srgb_to_linear(
+            lip_hsv_to_rgb(
+                lipstickHS.x,
+                lipstickHS.y,
+                targetValue
+            )
+        );
+        if (uniforms.shadingDebugMode > 0.5) {
+            LipFragmentOutput debugOutput;
+            debugOutput.material = float4(
+                lip_srgb_to_linear(float3(targetValue)),
+                1.0
+            );
+            debugOutput.shine = 0.0;
+            return debugOutput;
+        }
+        // Use the camera's real reflection pattern as the finish highlight.
         // A wider cross-shaped neighbourhood separates an existing bright
         // spot from the surrounding lip tone without inventing its position.
         float2 highlightRadius = uniforms.sourceTexelSize * float2(12.0, 8.0);
-        float3 highlightSurround =
+        float3 highlightSurround = lip_srgb_to_linear(
             cameraTexture.sample(
                 cameraSampler,
                 input.sourceUV + float2(highlightRadius.x, 0.0)
-            ).rgb;
-        highlightSurround += cameraTexture.sample(
+            ).rgb
+        );
+        highlightSurround += lip_srgb_to_linear(cameraTexture.sample(
             cameraSampler,
             input.sourceUV - float2(highlightRadius.x, 0.0)
-        ).rgb;
-        highlightSurround += cameraTexture.sample(
+        ).rgb);
+        highlightSurround += lip_srgb_to_linear(cameraTexture.sample(
             cameraSampler,
             input.sourceUV + float2(0.0, highlightRadius.y)
-        ).rgb;
-        highlightSurround += cameraTexture.sample(
+        ).rgb);
+        highlightSurround += lip_srgb_to_linear(cameraTexture.sample(
             cameraSampler,
             input.sourceUV - float2(0.0, highlightRadius.y)
-        ).rgb;
+        ).rgb);
         highlightSurround *= 0.25;
 
         float baseLuminance = lip_luminance(base);
-        float blurredLuminance = max(lip_luminance(blurred), 0.055);
-        float localLighting = smoothstep(0.10, 0.55, blurredLuminance);
-        float combinedLighting = clamp(
-            mix(uniforms.lightingFactor, localLighting, 0.25),
-            0.45,
-            1.0
+        float mediumLuminance = max(
+            lip_luminance(highlightSurround),
+            0.0045
         );
-        // SceneKit applies the single, deliberately shallow low-light response
-        // to both Metal and CPU textures. Keep the generated pigment at the
-        // catalogue RGB here so lighting cannot be applied twice.
-        float3 saturatedPigment = uniforms.lipstickColor.rgb;
-        float logDetail = log2(max(baseLuminance, 0.04)) -
-            log2(max(blurredLuminance, 0.04));
-        float brightScene = smoothstep(0.78, 1.0, combinedLighting);
         float textureY = 1.0 - input.canonicalUV.y;
         float cornerPosition = clamp(abs(input.canonicalUV.x - 0.5) * 2.0, 0.0, 1.0);
         float cornerRegion = smoothstep(0.62, 0.96, cornerPosition);
         float innerSeamRegion = 1.0 - smoothstep(0.018, 0.085, abs(textureY - 0.50));
-        float localShadow = 1.0 - smoothstep(0.16, 0.42, blurredLuminance);
         float apertureClosure = saturate(uniforms.apertureClosure);
         float openMouth = 1.0 - apertureClosure;
-        bool isSatin = uniforms.finish > 1.5;
+        bool isMatte = uniforms.finish < 0.5;
         bool isGloss = uniforms.finish > 0.5 && uniforms.finish < 1.5;
-        float lowDensityGloss = isGloss ?
-            1.0 - smoothstep(0.60, 0.72, uniforms.coreCoverage) :
-            0.0;
-        float detailExponent;
-        if (uniforms.finish < 0.5) {
-            // Matte pigment is diffuse, but not flat. Preserve camera-derived
-            // creases more strongly than highlights so the lip volume remains
-            // visible without introducing a wet/specular appearance.
-            float shadowDetail = min(logDetail, 0.0);
-            float highlightDetail = max(logDetail, 0.0);
-            float matteShadowStrength = mix(1.15, 0.72, brightScene);
-            float matteHighlightStrength = mix(0.65, 0.35, brightScene);
-            detailExponent =
-                clamp(shadowDetail, -0.14, 0.0) *
-                    uniforms.detailStrength * matteShadowStrength +
-                clamp(highlightDetail, 0.0, 0.09) *
-                    uniforms.detailStrength * matteHighlightStrength;
-        } else {
-            float adaptiveDetailStrength = uniforms.detailStrength *
-                mix(1.0, 0.45, brightScene);
-            float shadowDetail = min(logDetail, 0.0);
-            float highlightDetail = max(logDetail, 0.0);
-            detailExponent =
-                clamp(shadowDetail, -0.14, 0.0) *
-                    adaptiveDetailStrength * (isSatin ? 1.30 : 1.14) +
-                clamp(highlightDetail, 0.0, 0.10) *
-                    adaptiveDetailStrength * (isSatin ? 0.92 : 0.96);
-        }
-        float detail = exp2(detailExponent);
-        float3 pigment = saturatedPigment;
-        float seamShadow = 1.0 - innerSeamRegion *
-            smoothstep(0.30, 0.56, openMouth) *
-            (0.020 + localShadow * 0.08);
-        pigment = saturate(pigment * detail * seamShadow);
-
-        // A low-density gloss is a tinted transparent medium: mix its RGB
-        // with the captured lip colour first, then render that result with a
-        // confident mask. This is materially different from merely lowering
-        // the opacity of an otherwise opaque lipstick colour.
-        float3 naturalLipColor = saturate(
-            blurred + (base - blurred) * 0.35
-        );
-        pigment = mix(
-            pigment,
-            naturalLipColor,
-            lowDensityGloss * 0.6
-        );
-
-        float toothGuard = lip_tooth_probability(base) *
+        bool isOil = uniforms.finish > 2.5 && uniforms.finish < 3.5;
+        bool isWet = isGloss || isOil;
+        float toothGuard = lip_tooth_probability(baseSRGB) *
             smoothstep(0.24, 0.46, openMouth) *
             innerSeamRegion;
 
+        float currentShine = 0.0;
         if (uniforms.highlightStrength > 0.001) {
-            // Both finishes inherit the reflection shape from the camera.
-            // Gloss extracts only the strongest core of that real reflection
-            // and amplifies it, instead of drawing a fixed highlight in UV.
-            float surroundLuminance = max(
-                lip_luminance(highlightSurround),
-                0.04
-            );
+            // Use only the camera's real high-frequency reflection. Brightness
+            // is amplified later without generating a synthetic lower-lip
+            // lobe or increasing the spatial footprint of this signal.
             float highlightLogContrast = log2(
-                max(baseLuminance, 0.04) / surroundLuminance
-            );
+                max(baseLuminance, 0.0031) / mediumLuminance
+            ) * 0.45;
             float relativeHighlight = smoothstep(
-                isGloss ? 0.006 : 0.035,
-                isGloss ? 0.11 : 0.22,
+                0.001,
+                0.065,
                 highlightLogContrast
             );
             float highlightBrightness = smoothstep(
-                isGloss ? 0.07 : 0.18,
-                isGloss ? 0.48 : 0.68,
+                0.012,
+                0.220,
                 baseLuminance
             );
-            float highlightDifference = max(
-                baseLuminance - surroundLuminance,
-                0.0
+            float3 highlightResidual = max(
+                base - highlightSurround,
+                float3(0.0)
             );
-            float realHighlightSignal = saturate(
-                relativeHighlight * highlightBrightness
+            float residualMaximum = max(
+                highlightResidual.r,
+                max(highlightResidual.g, highlightResidual.b)
             );
-            float liquidResponse = smoothstep(
-                1.20,
-                1.80,
-                uniforms.highlightConcentration
+            float residualCommon = min(
+                highlightResidual.r,
+                min(highlightResidual.g, highlightResidual.b)
             );
-            float naturalHighlight;
-            if (isGloss) {
-                // Keep the exact silhouette and position of the reflection
-                // captured by the camera. Liquid may concentrate it a little
-                // more, but no fixed UV-space highlight is introduced.
-                float highlightCore = smoothstep(
-                    mix(0.08, 0.16, liquidResponse),
-                    mix(0.50, 0.62, liquidResponse),
-                    realHighlightSignal
+            // A dielectric reflection raises all colour channels toward the
+            // illuminant. This rejects bright red lip texture that has local
+            // luminance contrast but is not a real specular reflection.
+            float residualBalance = residualCommon /
+                max(residualMaximum, 0.0001);
+            float illuminantEvidence = smoothstep(
+                0.18,
+                0.62,
+                residualBalance
+            );
+            float cameraShineMask = saturate(
+                relativeHighlight * highlightBrightness *
+                    mix(0.30, 1.0, illuminantEvidence)
+            );
+
+            if (isWet) {
+                float wetMask = smoothstep(
+                    uniforms.shineMaskMinimum,
+                    uniforms.shineMaskMaximum,
+                    cameraShineMask
                 );
-                naturalHighlight = pow(
-                    highlightCore,
-                    max(uniforms.highlightConcentration, 1.0)
+                // Separate the observed reflection from the diffuse lipstick
+                // value before adding the white wet-specular layer below.
+                // Otherwise the same camera highlight appears once as a
+                // coloured bright patch and again as a white reflection.
+                float3 highlightSurroundSRGB = lip_linear_to_srgb(
+                    highlightSurround
                 );
-            } else {
-                naturalHighlight = pow(
-                    realHighlightSignal,
-                    max(uniforms.highlightConcentration, 1.0)
+                float highlightSurroundValue = max(
+                    highlightSurroundSRGB.r,
+                    max(
+                        highlightSurroundSRGB.g,
+                        highlightSurroundSRGB.b
+                    )
                 );
-            }
-            float highlightAmount;
-            if (isGloss) {
-                float glossPeakLimit = uniforms.highlightMaximum;
-                highlightAmount = min(
-                    (pow(realHighlightSignal, 1.35) * 0.035 +
-                        naturalHighlight * 0.14) *
+                float diffuseCameraValue = mix(
+                    cameraValue,
+                    min(cameraValue, highlightSurroundValue),
+                    wetMask * 0.82
+                );
+                float diffuseTargetValue = saturate(
+                    diffuseCameraValue * lipstickValue / 0.85
+                );
+                cameraAwarePigment = lip_srgb_to_linear(
+                    lip_hsv_to_rgb(
+                        lipstickHS.x,
+                        lipstickHS.y,
+                        diffuseTargetValue
+                    )
+                );
+                float wetExponent = isOil ? 1.05 : 1.30;
+                float wetStrength = isOil ? 0.42 : 0.24;
+                currentShine = min(
+                    pow(wetMask, wetExponent) * wetStrength *
                         uniforms.highlightStrength,
-                    glossPeakLimit
+                    uniforms.highlightMaximum
                 );
             } else {
-                highlightAmount = min(
-                    naturalHighlight *
-                        (0.07 + highlightDifference * 0.90) *
+                float satinMask = smoothstep(
+                    uniforms.shineMaskMinimum,
+                    uniforms.shineMaskMaximum,
+                    cameraShineMask
+                );
+                float softShineStrength = isMatte ? 0.22 : 0.26;
+                currentShine = min(
+                    pow(satinMask, 1.20) * softShineStrength *
                         uniforms.highlightStrength,
                     uniforms.highlightMaximum
                 );
             }
-            highlightAmount *=
+            // Exact inner/outer-boundary exclusion happens in a following
+            // signed-distance pass using this frame's detected contours.
+            currentShine *=
                 (1.0 - cornerRegion * 0.82) *
                 (1.0 - innerSeamRegion *
-                    (isGloss ?
+                    (isWet ?
                         mix(0.30, 0.58, apertureClosure) :
                         mix(0.74, 0.92, apertureClosure))) *
                 (1.0 - toothGuard * 0.96);
-            pigment = mix(pigment, float3(1.0), highlightAmount);
         }
 
-        pigment = mix(
-            pigment,
-            base * (1.0 - localShadow * 0.05),
-            toothGuard * 0.94
+        // Density is the only diffuse blending difference between products.
+        // The camera already owns the light and shadow in cameraAwarePigment;
+        // applying corner fades or inverse-alpha correction here would expose
+        // bright seams and flatten that captured value field.
+        LipFragmentOutput output;
+        output.material = float4(
+            cameraAwarePigment,
+            uniforms.coreCoverage
         );
+        output.shine = currentShine;
+        return output;
+    }
 
-        // Keep only a real dark fold at the very tip of each mouth corner.
-        // The fold changes luminance while retaining the selected lipstick
-        // hue, and activates only when the camera actually sees a darker area.
-        float cornerTip = smoothstep(0.86, 1.0, cornerPosition);
-        float finalPigmentLuminance = lip_luminance(pigment);
-        float capturedCornerLuminance = min(baseLuminance, blurredLuminance);
-        float cornerShadowEvidence = smoothstep(
-            0.025,
-            0.18,
-            finalPigmentLuminance - capturedCornerLuminance
-        );
-        float retainedCornerLuminance = max(
-            capturedCornerLuminance,
-            finalPigmentLuminance * 0.58
-        );
-        float cornerTargetLuminance = mix(
-            finalPigmentLuminance,
-            retainedCornerLuminance,
-            cornerTip * cornerShadowEvidence * 0.76
-        );
-        pigment = lip_color_with_luminance(pigment, cornerTargetLuminance);
+    kernel void lip_temporal_shine(
+        texture2d<float, access::read> currentTexture [[texture(0)]],
+        texture2d<float, access::read> historyTexture [[texture(1)]],
+        texture2d<float, access::write> outputTexture [[texture(2)]],
+        constant LipShineTemporalUniforms &uniforms [[buffer(0)]],
+        uint2 position [[thread_position_in_grid]]) {
+        if (position.x >= outputTexture.get_width() ||
+            position.y >= outputTexture.get_height()) {
+            return;
+        }
 
-        // Keep the reduction shallow and confined to the final part of each
-        // corner. It is applied after colour compensation below, so it reveals
-        // a little of the real lip instead of recalculating a denser corrective
-        // colour or creating the broad pale halo of the previous corner fade.
-        float cornerOpacity = 1.0 -
-            smoothstep(0.82, 0.98, cornerPosition) * 0.12;
-        // Restore most of the catalogue saturation without making translucent
-        // products look like an opaque sticker. Lower-density formulas retain
-        // progressively more of the natural lip colour.
-        float outputCoverage = mix(
-            uniforms.coreCoverage,
-            0.45,
-            lowDensityGloss
-        );
-        float compensationAlpha = mix(
-            uniforms.coreCoverage,
-            0.92,
-            0.55
-        );
-        compensationAlpha = mix(
-            compensationAlpha,
-            outputCoverage,
-            lowDensityGloss
-        );
-        // Compensate only the low-frequency lip colour. SceneKit then restores
-        // the difference between the real pixel and this local average, so
-        // folds and fine texture pass through without shifting the shade's
-        // overall brightness toward the natural lip colour.
-        float3 correctiveColor = saturate(
-            (pigment - blurred * (1.0 - compensationAlpha)) /
-                max(compensationAlpha, 0.001)
-        );
-        return float4(
-            correctiveColor,
-            outputCoverage * cornerOpacity
-        );
+        float current = saturate(currentTexture.read(position).r);
+        float stabilized = current;
+        if (uniforms.historyValid > 0.5) {
+            float previous = saturate(historyTexture.read(position).r);
+            float delta = abs(current - previous);
+            float responsiveWeight = mix(
+                current < previous ?
+                    uniforms.releaseCurrentWeight :
+                    uniforms.riseCurrentWeight,
+                0.94,
+                smoothstep(0.08, 0.34, delta)
+            );
+            stabilized = mix(previous, current, responsiveWeight);
+            // A disappearing reflection must not leave a floating bright trail
+            // on the canonical lip texture after the head starts moving.
+            if (current < 0.003 && stabilized < 0.035) {
+                stabilized = 0.0;
+            }
+        }
+        outputTexture.write(float4(stabilized), position);
+    }
+
+    kernel void lip_apply_shine(
+        texture2d<float, access::read> materialTexture [[texture(0)]],
+        texture2d<float, access::read> shineTexture [[texture(1)]],
+        texture2d<float, access::write> outputTexture [[texture(2)]],
+        constant float &finish [[buffer(0)]],
+        uint2 position [[thread_position_in_grid]]) {
+        if (position.x >= outputTexture.get_width() ||
+            position.y >= outputTexture.get_height()) {
+            return;
+        }
+        float4 material = materialTexture.read(position);
+        float shine = saturate(shineTexture.read(position).r);
+        bool isGloss = finish > 0.5 && finish < 1.5;
+        bool isOil = finish > 2.5 && finish < 3.5;
+        if (isGloss || isOil) {
+            // Wet specular reflection is achromatic. Keep its compact mask but
+            // drive the core visibly toward white; oil is the brighter finish.
+            float whiteAmount = saturate(
+                shine * (isOil ? 2.30 : 1.45)
+            );
+            material.rgb = mix(material.rgb, float3(1.0), whiteAmount);
+        } else {
+            // Satin and subtle matte shine raise value softly while retaining
+            // most of the product saturation.
+            float3 materialSRGB = lip_linear_to_srgb(material.rgb);
+            float2 materialHS = lip_hsv_hue_saturation(materialSRGB);
+            float materialValue = max(
+                materialSRGB.r,
+                max(materialSRGB.g, materialSRGB.b)
+            );
+            float visibleShine = saturate(
+                shine * (finish < 0.5 ? 1.30 : 1.40)
+            );
+            material.rgb = lip_srgb_to_linear(
+                lip_hsv_to_rgb(
+                    materialHS.x,
+                    materialHS.y * (1.0 - visibleShine * 0.22),
+                    mix(materialValue, 1.0, visibleShine)
+                )
+            );
+        }
+        outputTexture.write(material, position);
     }
 
     float lip_distance_to_segment(float2 point, float2 first, float2 second) {
@@ -487,6 +653,148 @@ final class MetalLipColorCompositor {
         float denominator = max(dot(segment, segment), 0.0001);
         float position = clamp(dot(point - first, segment) / denominator, 0.0, 1.0);
         return distance(point, first + segment * position);
+    }
+
+    kernel void lip_gate_shine(
+        texture2d<float, access::read> inputTexture [[texture(0)]],
+        texture2d<float, access::write> outputTexture [[texture(1)]],
+        const device float2 *outerPoints [[buffer(0)]],
+        constant LipShineGeometryUniforms &uniforms [[buffer(1)]],
+        const device float2 *innerPoints [[buffer(2)]],
+        uint2 position [[thread_position_in_grid]]) {
+        if (position.x >= outputTexture.get_width() ||
+            position.y >= outputTexture.get_height()) {
+            return;
+        }
+        if (uniforms.outerPointCount < 3 ||
+            uniforms.innerPointCount < 3) {
+            outputTexture.write(float4(0.0), position);
+            return;
+        }
+
+        float inputShine = saturate(inputTexture.read(position).r);
+        if (inputShine <= 0.0001) {
+            outputTexture.write(float4(0.0), position);
+            return;
+        }
+
+        float2 pixelPoint = float2(position) + 0.5;
+        float outerMinimumDistance = 100000.0;
+        float outerMinimumX = 100000.0;
+        float outerMaximumX = -100000.0;
+        bool isInsideOuter = false;
+        uint outerPrevious = uniforms.outerPointCount - 1;
+        for (uint index = 0; index < uniforms.outerPointCount; ++index) {
+            float2 first = outerPoints[outerPrevious];
+            float2 second = outerPoints[index];
+            outerMinimumDistance = min(
+                outerMinimumDistance,
+                lip_distance_to_segment(pixelPoint, first, second)
+            );
+            outerMinimumX = min(outerMinimumX, second.x);
+            outerMaximumX = max(outerMaximumX, second.x);
+            bool crosses =
+                (first.y > pixelPoint.y) != (second.y > pixelPoint.y);
+            if (crosses) {
+                float denominator = second.y - first.y;
+                float intersectionX = first.x +
+                    (pixelPoint.y - first.y) *
+                    (second.x - first.x) /
+                    (abs(denominator) < 0.0001 ? 0.0001 : denominator);
+                if (pixelPoint.x < intersectionX) {
+                    isInsideOuter = !isInsideOuter;
+                }
+            }
+            outerPrevious = index;
+        }
+
+        float innerMinimumDistance = 100000.0;
+        float innerMinimumY = 100000.0;
+        float innerMaximumY = -100000.0;
+        bool isInsideAperture = false;
+        uint innerPrevious = uniforms.innerPointCount - 1;
+        for (uint index = 0; index < uniforms.innerPointCount; ++index) {
+            float2 first = innerPoints[innerPrevious];
+            float2 second = innerPoints[index];
+            innerMinimumDistance = min(
+                innerMinimumDistance,
+                lip_distance_to_segment(pixelPoint, first, second)
+            );
+            innerMinimumY = min(innerMinimumY, second.y);
+            innerMaximumY = max(innerMaximumY, second.y);
+            bool crosses =
+                (first.y > pixelPoint.y) != (second.y > pixelPoint.y);
+            if (crosses) {
+                float denominator = second.y - first.y;
+                float intersectionX = first.x +
+                    (pixelPoint.y - first.y) *
+                    (second.x - first.x) /
+                    (abs(denominator) < 0.0001 ? 0.0001 : denominator);
+                if (pixelPoint.x < intersectionX) {
+                    isInsideAperture = !isInsideAperture;
+                }
+            }
+            innerPrevious = index;
+        }
+
+        if (!isInsideOuter || isInsideAperture) {
+            outputTexture.write(float4(0.0), position);
+            return;
+        }
+
+        // Measure position across the actual lip thickness. Zero is the inner
+        // contour and one is the outer contour, regardless of lip shape.
+        float surfacePosition = innerMinimumDistance / max(
+            innerMinimumDistance + outerMinimumDistance,
+            0.001
+        );
+        bool isGloss = uniforms.finish > 0.5 && uniforms.finish < 1.5;
+        bool isOil = uniforms.finish > 2.5 && uniforms.finish < 3.5;
+        float outerFadeStart = isGloss ? 0.58 : (isOil ? 0.60 : 0.70);
+        float outerFadeEnd = isGloss ? 0.70 : (isOil ? 0.73 : 0.86);
+        float contourDistanceGate =
+            smoothstep(0.18, 0.34, surfacePosition) *
+            (1.0 - smoothstep(
+                outerFadeStart,
+                outerFadeEnd,
+                surfacePosition
+            ));
+
+        float normalizedX = saturate(
+            (pixelPoint.x - outerMinimumX) /
+                max(outerMaximumX - outerMinimumX, 0.001)
+        );
+        float lowerFadeInStart = isGloss ? 0.24 : (isOil ? 0.21 : 0.14);
+        float lowerFadeInEnd = isGloss ? 0.32 : (isOil ? 0.29 : 0.26);
+        float lowerFadeOutStart = isGloss ? 0.68 : (isOil ? 0.71 : 0.74);
+        float lowerFadeOutEnd = isGloss ? 0.76 : (isOil ? 0.79 : 0.86);
+        float lowerHorizontalGate =
+            smoothstep(lowerFadeInStart, lowerFadeInEnd, normalizedX) *
+            (1.0 - smoothstep(
+                lowerFadeOutStart,
+                lowerFadeOutEnd,
+                normalizedX
+            ));
+        float cupidStripe = 1.0 - smoothstep(
+            0.035,
+            0.095,
+            abs(normalizedX - 0.5)
+        );
+        float mouthCenterY = (innerMinimumY + innerMaximumY) * 0.5;
+        float lowerLip = smoothstep(
+            mouthCenterY - 0.5,
+            mouthCenterY + max(uniforms.textureSize.y * 0.025, 1.0),
+            pixelPoint.y
+        );
+        float surfaceRegionGate = mix(
+            cupidStripe,
+            lowerHorizontalGate,
+            lowerLip
+        );
+        float geometryGate = saturate(
+            contourDistanceGate * surfaceRegionGate
+        );
+        outputTexture.write(float4(inputShine * geometryGate), position);
     }
 
     kernel void lip_composite(
@@ -550,7 +858,7 @@ final class MetalLipColorCompositor {
         // the same pigment across the exterior carrier. The two smoothstep
         // curves meet at the same coverage with zero slope, avoiding a visible
         // vector-like seam while leaving the rest of the lip untouched.
-        const float contourCoverage = 0.68;
+        const float contourCoverage = 0.76;
         float innerFeatherPosition = saturate(
             (signedDistance + innerFeatherDistance) /
                 innerFeatherDistance
@@ -623,6 +931,18 @@ final class MetalLipColorCompositor {
         }
 
         float maskCoverage = outerFeather * apertureFeather;
+        if (uniforms.finish > 3.5) {
+            // A tint stains the moist inner lip most strongly, then loses
+            // pigment continuously toward the outer vermilion contour.
+            float tintInnerPosition = minimumDistance /
+                max(minimumDistance + innerMinimumDistance, 0.001);
+            float tintDistribution = mix(
+                0.58,
+                1.0,
+                smoothstep(0.0, 0.86, tintInnerPosition)
+            );
+            maskCoverage *= tintDistribution;
+        }
         float recoverableInnerFeatherPixels =
             max(uniforms.apertureFeatherPixels, 0.0) +
             max(uniforms.apertureMouthFeatherPixels, 0.0);
@@ -751,20 +1071,37 @@ final class MetalLipColorCompositor {
         // or a clipped SceneKit silhouette.
         float blurGate = blurGateTexture.read(position).r;
         float softenedAlpha = min(mixedAlpha, blurGate);
-        outputTexture.write(float4(center.rgb, softenedAlpha), position);
+        // This is the only colour-space exit from the linear Metal pipeline.
+        // The 8-bit readback is tagged sRGB when it becomes a CGImage.
+        outputTexture.write(
+            float4(lip_linear_to_srgb(center.rgb), softenedAlpha),
+            position
+        );
     }
     """#
 
     private let context: Context?
     private let availabilityLock = NSLock()
+    private let temporalStateLock = NSLock()
     private var consecutiveRuntimeFailures = 0
     private var isRuntimeDisabled = false
+    private var smoothedReferenceLipLuminance: Float?
+    private var isShineHistoryValid = false
+    private var temporalGeneration: UInt64 = 0
 
     var isAvailable: Bool {
         availabilityLock.lock()
         let available = context != nil && !isRuntimeDisabled
         availabilityLock.unlock()
         return available
+    }
+
+    func resetTemporalState() {
+        temporalStateLock.lock()
+        temporalGeneration &+= 1
+        smoothedReferenceLipLuminance = nil
+        isShineHistoryValid = false
+        temporalStateLock.unlock()
     }
 
     init() {
@@ -802,6 +1139,15 @@ final class MetalLipColorCompositor {
             let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
             guard let vertexFunction = library.makeFunction(name: "lip_vertex"),
                   let fragmentFunction = library.makeFunction(name: "lip_fragment"),
+                  let shineTemporalFunction = library.makeFunction(
+                    name: "lip_temporal_shine"
+                  ),
+                  let shineGeometryFunction = library.makeFunction(
+                    name: "lip_gate_shine"
+                  ),
+                  let shineApplyFunction = library.makeFunction(
+                    name: "lip_apply_shine"
+                  ),
                   let compositeFunction = library.makeFunction(name: "lip_composite"),
                   let alphaBlurHorizontalFunction = library.makeFunction(
                     name: "lip_gaussian_blur_alpha_horizontal"
@@ -822,9 +1168,19 @@ final class MetalLipColorCompositor {
             renderDescriptor.label = "VirtualMakeup.LipColor"
             renderDescriptor.vertexFunction = vertexFunction
             renderDescriptor.fragmentFunction = fragmentFunction
-            renderDescriptor.colorAttachments[0].pixelFormat = .rgba8Unorm
+            renderDescriptor.colorAttachments[0].pixelFormat = .rgba16Float
+            renderDescriptor.colorAttachments[1].pixelFormat = .r16Float
             let renderPipeline = try device.makeRenderPipelineState(descriptor: renderDescriptor)
 
+            let shineTemporalPipeline = try device.makeComputePipelineState(
+                function: shineTemporalFunction
+            )
+            let shineGeometryPipeline = try device.makeComputePipelineState(
+                function: shineGeometryFunction
+            )
+            let shineApplyPipeline = try device.makeComputePipelineState(
+                function: shineApplyFunction
+            )
             let compositePipeline = try device.makeComputePipelineState(function: compositeFunction)
             let alphaBlurHorizontalPipeline = try device.makeComputePipelineState(
                 function: alphaBlurHorizontalFunction
@@ -859,6 +1215,9 @@ final class MetalLipColorCompositor {
                 commandQueue: commandQueue,
                 textureCache: textureCache,
                 renderPipeline: renderPipeline,
+                shineTemporalPipeline: shineTemporalPipeline,
+                shineGeometryPipeline: shineGeometryPipeline,
+                shineApplyPipeline: shineApplyPipeline,
                 compositePipeline: compositePipeline,
                 alphaBlurHorizontalPipeline: alphaBlurHorizontalPipeline,
                 alphaBlurVerticalPipeline: alphaBlurVerticalPipeline,
@@ -880,31 +1239,6 @@ final class MetalLipColorCompositor {
         }
     }
 
-    private static func parameters(for finish: LipFinish) -> FinishParameters {
-        switch finish {
-        case .matte:
-            return FinishParameters(
-                detailStrength: 1.9,
-                highlightStrength: 0,
-                highlightMaximum: 0
-            )
-        case .satin:
-            return FinishParameters(
-                detailStrength: 1.7,
-                highlightStrength: 1.16,
-                highlightMaximum: 0.48
-            )
-        case .gloss:
-            // Gloss brightness comes from captured reflections. Low-density
-            // colour mixing is handled separately in the fragment shader.
-            return FinishParameters(
-                detailStrength: 1.9,
-                highlightStrength: 1.05,
-                highlightMaximum: 0.20
-            )
-        }
-    }
-
     func makeTexture(contour: LipContour,
                      pixelBuffer: CVPixelBuffer,
                      imageSize: CGSize,
@@ -915,8 +1249,15 @@ final class MetalLipColorCompositor {
                      color: RGBColor,
                      lightingFactor: CGFloat,
                      finish: LipFinish,
-                     density: LipstickDensity,
-                     texture: LipstickTexture) -> LipTexture? {
+                     materialProfile: LipMaterialProfile,
+                     shadingDebugMode: LipShadingDebugMode,
+                     lowLatency: Bool,
+                     motionDelta: CGFloat,
+                     completionQueue: DispatchQueue,
+                     completion: @escaping (LipTexture?) -> Void) {
+        temporalStateLock.lock()
+        let generation = temporalGeneration
+        temporalStateLock.unlock()
         guard let context,
               isAvailable,
               pixelWidth > 1,
@@ -942,11 +1283,18 @@ final class MetalLipColorCompositor {
                 width: pixelWidth,
                 height: pixelHeight
               ) else {
-            return nil
+            completion(nil)
+            return
         }
 
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let referenceLipLuminance = stabilizedReferenceLipLuminance(
+            Self.referenceLipLuminance(
+                pixelBuffer: pixelBuffer,
+                vertices: vertices
+            ), generation: generation
+        ) ?? 0
         var cameraTextureReference: CVMetalTexture?
         let textureStatus = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault,
@@ -963,12 +1311,14 @@ final class MetalLipColorCompositor {
               let cameraTextureReference,
               let cameraTexture = CVMetalTextureGetTexture(cameraTextureReference) else {
             recordRuntimeFailure("camera_texture status=\(textureStatus)")
-            return nil
+            completion(nil)
+            return
         }
 
         guard let commandBuffer = context.commandQueue.makeCommandBuffer() else {
             recordRuntimeFailure("command_buffer")
-            return nil
+            completion(nil)
+            return
         }
         commandBuffer.label = "VirtualMakeup.LipComposite"
 
@@ -977,9 +1327,14 @@ final class MetalLipColorCompositor {
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .store
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+        pass.colorAttachments[1].texture = targets.currentShine
+        pass.colorAttachments[1].loadAction = .clear
+        pass.colorAttachments[1].storeAction = .store
+        pass.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0)
         guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             recordRuntimeFailure("render_encoder")
-            return nil
+            completion(nil)
+            return
         }
         renderEncoder.label = "VirtualMakeup.LipShade"
         renderEncoder.setRenderPipelineState(context.renderPipeline)
@@ -990,7 +1345,6 @@ final class MetalLipColorCompositor {
         }
         let smoothApertureOpening = contour.innerApertureVisibility
         let apertureClosure = Float(1 - smoothApertureOpening)
-        let finishParameters = Self.parameters(for: finish)
         var uniforms = Uniforms(
             lipstickColor: SIMD4<Float>(color.red, color.green, color.blue, 1),
             sourceTexelSize: SIMD2<Float>(
@@ -999,16 +1353,24 @@ final class MetalLipColorCompositor {
             ),
             // The camera contributes lightness/detail, never its RGB hue.
             lightingFactor: Float(max(0.5, min(lightingFactor, 1))),
-            detailStrength:
-                finishParameters.detailStrength * texture.detailResponse,
-            coreCoverage: density.pigmentCoverage,
-            highlightStrength:
-                finishParameters.highlightStrength * texture.highlightResponse,
-            highlightMaximum:
-                finishParameters.highlightMaximum * texture.highlightLimitResponse,
-            highlightConcentration: texture.highlightConcentration,
+            detailStrength: materialProfile.capturedDetailStrength,
+            diffuseLightResponse: materialProfile.diffuseLightResponse,
+            coreCoverage: materialProfile.pigmentCoverage,
+            highlightStrength: materialProfile.capturedHighlightStrength,
+            highlightMaximum: materialProfile.capturedHighlightMaximum,
+            highlightConcentration: materialProfile.highlightConcentration,
             finish: Float(finish.rawValue),
-            apertureClosure: apertureClosure
+            apertureClosure: apertureClosure,
+            naturalLipColorWeight: materialProfile.naturalLipColorWeight,
+            shadowRetention: materialProfile.shadowRetention,
+            shineMaskMinimum: materialProfile.shineMaskMinimum,
+            shineMaskMaximum: materialProfile.shineMaskMaximum,
+            referenceLipLuminance: referenceLipLuminance,
+            capturedShadowMaximumStops:
+                materialProfile.capturedShadowMaximumStops,
+            capturedDiffuseLightMaximumStops:
+                materialProfile.capturedDiffuseLightMaximumStops,
+            shadingDebugMode: Float(shadingDebugMode.rawValue)
         )
         renderEncoder.setFragmentBytes(
             &uniforms,
@@ -1026,13 +1388,169 @@ final class MetalLipColorCompositor {
         )
         renderEncoder.endEncoding()
 
+        guard let shineTemporalEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            recordRuntimeFailure("shine_temporal_encoder")
+            completion(nil)
+            return
+        }
+        shineTemporalEncoder.label = "VirtualMakeup.LipShineTemporal"
+        shineTemporalEncoder.setComputePipelineState(
+            context.shineTemporalPipeline
+        )
+        shineTemporalEncoder.setTexture(targets.currentShine, index: 0)
+        shineTemporalEncoder.setTexture(targets.shineHistory, index: 1)
+        shineTemporalEncoder.setTexture(targets.stabilizedShine, index: 2)
+        let normalizedMotion = Float(max(0, min(motionDelta / 0.22, 1)))
+        var shineTemporalUniforms = ShineTemporalUniforms(
+            riseCurrentWeight: min(
+                0.94,
+                (lowLatency ? 0.86 : 0.78) + normalizedMotion * 0.12
+            ),
+            releaseCurrentWeight: min(
+                0.98,
+                0.90 + normalizedMotion * 0.08
+            ),
+            historyValid: shineHistoryIsValid() ? 1 : 0
+        )
+        shineTemporalEncoder.setBytes(
+            &shineTemporalUniforms,
+            length: MemoryLayout<ShineTemporalUniforms>.stride,
+            index: 0
+        )
+        let shineTemporalThreadWidth =
+            context.shineTemporalPipeline.threadExecutionWidth
+        let shineTemporalThreadHeight = max(
+            1,
+            context.shineTemporalPipeline.maxTotalThreadsPerThreadgroup /
+                max(shineTemporalThreadWidth, 1)
+        )
+        shineTemporalEncoder.dispatchThreads(
+            MTLSize(width: pixelWidth, height: pixelHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: shineTemporalThreadWidth,
+                height: min(shineTemporalThreadHeight, 16),
+                depth: 1
+            )
+        )
+        shineTemporalEncoder.endEncoding()
+
+        guard let shineGeometryEncoder =
+                commandBuffer.makeComputeCommandEncoder() else {
+            recordRuntimeFailure("shine_geometry_encoder")
+            completion(nil)
+            return
+        }
+        shineGeometryEncoder.label = "VirtualMakeup.LipShineGeometry"
+        shineGeometryEncoder.setComputePipelineState(
+            context.shineGeometryPipeline
+        )
+        shineGeometryEncoder.setTexture(targets.stabilizedShine, index: 0)
+        shineGeometryEncoder.setTexture(targets.gatedShine, index: 1)
+        outerDistancePoints.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                shineGeometryEncoder.setBytes(
+                    baseAddress,
+                    length: bytes.count,
+                    index: 0
+                )
+            }
+        }
+        innerDistancePoints.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                shineGeometryEncoder.setBytes(
+                    baseAddress,
+                    length: bytes.count,
+                    index: 2
+                )
+            }
+        }
+        var shineGeometryUniforms = ShineGeometryUniforms(
+            textureSize: SIMD2<Float>(Float(pixelWidth), Float(pixelHeight)),
+            outerPointCount: UInt32(outerDistancePoints.count),
+            innerPointCount: UInt32(innerDistancePoints.count),
+            finish: Float(finish.rawValue)
+        )
+        shineGeometryEncoder.setBytes(
+            &shineGeometryUniforms,
+            length: MemoryLayout<ShineGeometryUniforms>.stride,
+            index: 1
+        )
+        let shineGeometryThreadWidth =
+            context.shineGeometryPipeline.threadExecutionWidth
+        let shineGeometryThreadHeight = max(
+            1,
+            context.shineGeometryPipeline.maxTotalThreadsPerThreadgroup /
+                max(shineGeometryThreadWidth, 1)
+        )
+        shineGeometryEncoder.dispatchThreads(
+            MTLSize(width: pixelWidth, height: pixelHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: shineGeometryThreadWidth,
+                height: min(shineGeometryThreadHeight, 16),
+                depth: 1
+            )
+        )
+        shineGeometryEncoder.endEncoding()
+
+        guard let shineApplyEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            recordRuntimeFailure("shine_apply_encoder")
+            completion(nil)
+            return
+        }
+        shineApplyEncoder.label = "VirtualMakeup.LipShineApply"
+        shineApplyEncoder.setComputePipelineState(context.shineApplyPipeline)
+        shineApplyEncoder.setTexture(targets.color, index: 0)
+        shineApplyEncoder.setTexture(targets.gatedShine, index: 1)
+        shineApplyEncoder.setTexture(targets.shadedColor, index: 2)
+        var shineFinish = Float(finish.rawValue)
+        shineApplyEncoder.setBytes(
+            &shineFinish,
+            length: MemoryLayout<Float>.stride,
+            index: 0
+        )
+        let shineApplyThreadWidth = context.shineApplyPipeline.threadExecutionWidth
+        let shineApplyThreadHeight = max(
+            1,
+            context.shineApplyPipeline.maxTotalThreadsPerThreadgroup /
+                max(shineApplyThreadWidth, 1)
+        )
+        shineApplyEncoder.dispatchThreads(
+            MTLSize(width: pixelWidth, height: pixelHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: shineApplyThreadWidth,
+                height: min(shineApplyThreadHeight, 16),
+                depth: 1
+            )
+        )
+        shineApplyEncoder.endEncoding()
+
+        guard let shineHistoryEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            recordRuntimeFailure("shine_history_encoder")
+            completion(nil)
+            return
+        }
+        shineHistoryEncoder.label = "VirtualMakeup.LipShineHistory"
+        shineHistoryEncoder.copy(
+            from: targets.gatedShine,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: pixelWidth, height: pixelHeight, depth: 1),
+            to: targets.shineHistory,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
+        shineHistoryEncoder.endEncoding()
+
         guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
             recordRuntimeFailure("compute_encoder")
-            return nil
+            completion(nil)
+            return
         }
         computeEncoder.label = "VirtualMakeup.LipFeather"
         computeEncoder.setComputePipelineState(context.compositePipeline)
-        computeEncoder.setTexture(targets.color, index: 0)
+        computeEncoder.setTexture(targets.shadedColor, index: 0)
         computeEncoder.setTexture(targets.output, index: 1)
         computeEncoder.setTexture(targets.blurGate, index: 2)
         outerDistancePoints.withUnsafeBytes { bytes in
@@ -1058,11 +1576,16 @@ final class MetalLipColorCompositor {
         // very narrow aperture, inward coverage overlaps across the canonical
         // hole and removes the seam. Once the mouth is visibly open, only a
         // short solid rim plus a compact transition remains over the mucosa.
-        let apertureOpening = Float(smoothApertureOpening)
-        let apertureSolidInnerCoverage: Float =
-            (1.45 - apertureOpening * 1.45) * maskPixelScale
-        let apertureInnerTransition: Float =
-            (0.55 - apertureOpening * 0.20) * maskPixelScale
+        let apertureSolidInnerCoverage = Float(
+            LipInnerBoundaryLayout.solidCoveragePixels(
+                opening: smoothApertureOpening
+            )
+        ) * maskPixelScale
+        let apertureInnerTransition = Float(
+            LipInnerBoundaryLayout.transitionPixels(
+                opening: smoothApertureOpening
+            )
+        ) * maskPixelScale
         var featherUniforms = FeatherUniforms(
             textureSize: SIMD2<Float>(Float(pixelWidth), Float(pixelHeight)),
             outerPointCount: UInt32(outerDistancePoints.count),
@@ -1077,7 +1600,8 @@ final class MetalLipColorCompositor {
             apertureFeatherPixels: apertureSolidInnerCoverage,
             apertureMouthFeatherPixels: apertureInnerTransition,
             apertureInsetPixels: 0,
-            apertureClosure: apertureClosure
+            apertureClosure: apertureClosure,
+            finish: Float(finish.rawValue)
         )
         computeEncoder.setBytes(
             &featherUniforms,
@@ -1101,7 +1625,8 @@ final class MetalLipColorCompositor {
 
         guard let horizontalBlurEncoder = commandBuffer.makeComputeCommandEncoder() else {
             recordRuntimeFailure("alpha_blur_horizontal_encoder")
-            return nil
+            completion(nil)
+            return
         }
         horizontalBlurEncoder.label = "VirtualMakeup.LipGaussianAlphaHorizontal"
         horizontalBlurEncoder.setComputePipelineState(
@@ -1128,7 +1653,8 @@ final class MetalLipColorCompositor {
 
         guard let verticalBlurEncoder = commandBuffer.makeComputeCommandEncoder() else {
             recordRuntimeFailure("alpha_blur_vertical_encoder")
-            return nil
+            completion(nil)
+            return
         }
         verticalBlurEncoder.label = "VirtualMakeup.LipGaussianAlphaVertical"
         verticalBlurEncoder.setComputePipelineState(
@@ -1156,91 +1682,106 @@ final class MetalLipColorCompositor {
         verticalBlurEncoder.endEncoding()
 
         let startedAt = CACurrentMediaTime()
-        withExtendedLifetime(cameraTextureReference) {
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-        }
-        guard commandBuffer.status == .completed else {
-            recordRuntimeFailure(
-                "gpu status=\(commandBuffer.status.rawValue) error=\(commandBuffer.error?.localizedDescription ?? "none")"
-            )
-            return nil
-        }
+        let riseWeight = shineTemporalUniforms.riseCurrentWeight
+        let releaseWeight = shineTemporalUniforms.releaseCurrentWeight
+        // One request owns the targets until completion (including readback).
+        // Keep both the CV wrapper and its source alive for the entire GPU job.
+        commandBuffer.addCompletedHandler { [self, cameraTextureReference, pixelBuffer] completedBuffer in
+            completionQueue.async { [self] in
+                withExtendedLifetime((cameraTextureReference, pixelBuffer)) {
+                    let completedAt = CACurrentMediaTime()
+                    guard completedBuffer.status == .completed else {
+                        self.recordRuntimeFailure(
+                            "gpu status=\(completedBuffer.status.rawValue) error=\(completedBuffer.error?.localizedDescription ?? "none")"
+                        )
+                        completion(nil)
+                        return
+                    }
+                    self.temporalStateLock.lock()
+                    let temporalContextIsCurrent = self.temporalGeneration == generation
+                    if temporalContextIsCurrent { self.isShineHistoryValid = true }
+                    self.temporalStateLock.unlock()
+                    guard temporalContextIsCurrent else { completion(nil); return }
 
-        var rgba = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
-        rgba.withUnsafeMutableBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else {
-                return
-            }
-            targets.softenedOutput.getBytes(
-                baseAddress,
-                bytesPerRow: pixelWidth * 4,
-                from: MTLRegionMake2D(0, 0, pixelWidth, pixelHeight),
-                mipmapLevel: 0
-            )
-        }
+                    var rgba = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
+                    rgba.withUnsafeMutableBytes { bytes in
+                        guard let baseAddress = bytes.baseAddress else {
+                            return
+                        }
+                        targets.softenedOutput.getBytes(
+                            baseAddress,
+                            bytesPerRow: pixelWidth * 4,
+                            from: MTLRegionMake2D(0, 0, pixelWidth, pixelHeight),
+                            mipmapLevel: 0
+                        )
+                    }
 #if DEBUG
-        LipDebugLog.throttled(
-            "lip_metal_alpha_stats",
-            interval: 0.75,
-            Self.alphaDiagnostics(rgba)
-        )
+                    LipDebugLog.throttled(
+                        "lip_metal_alpha_stats",
+                        interval: 0.75,
+                        Self.alphaDiagnostics(rgba)
+                    )
 #endif
-        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
-              let diffuseCGImage = CGImage(
-                width: pixelWidth,
-                height: pixelHeight,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: pixelWidth * 4,
-                space: CGColorSpace(name: CGColorSpace.sRGB) ??
-                    CGColorSpaceCreateDeviceRGB(),
-                // The fourth byte belongs exclusively to the opacity image.
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: true,
-                intent: .defaultIntent
-              ),
-              let opacityCGImage = CGImage(
-                width: pixelWidth,
-                height: pixelHeight,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: pixelWidth * 4,
-                space: CGColorSpace(name: CGColorSpace.sRGB) ??
-                    CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: true,
-                intent: .defaultIntent
-              ) else {
-            recordRuntimeFailure("cgimage")
-            return nil
-        }
+                    guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+                          let diffuseCGImage = CGImage(
+                            width: pixelWidth,
+                            height: pixelHeight,
+                            bitsPerComponent: 8,
+                            bitsPerPixel: 32,
+                            bytesPerRow: pixelWidth * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB) ??
+                                CGColorSpaceCreateDeviceRGB(),
+                            // The fourth byte belongs exclusively to the opacity image.
+                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                            provider: provider,
+                            decode: nil,
+                            shouldInterpolate: true,
+                            intent: .defaultIntent
+                          ),
+                          let opacityCGImage = CGImage(
+                            width: pixelWidth,
+                            height: pixelHeight,
+                            bitsPerComponent: 8,
+                            bitsPerPixel: 32,
+                            bytesPerRow: pixelWidth * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB) ??
+                                CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                            provider: provider,
+                            decode: nil,
+                            shouldInterpolate: true,
+                            intent: .defaultIntent
+                          ) else {
+                        self.recordRuntimeFailure("cgimage")
+                        completion(nil)
+                        return
+                    }
 
-        recordRuntimeSuccess()
-        let gpuMilliseconds = commandBuffer.gpuEndTime > commandBuffer.gpuStartTime ?
-            (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000 : 0
-        let blockingMilliseconds = (CACurrentMediaTime() - startedAt) * 1000
-        LipDebugLog.throttled(
-            "lip_metal_stats",
-            interval: 0.6,
-            "lip_metal frame size=\(pixelWidth)x\(pixelHeight) gpuMs=\(String(format: "%.2f", gpuMilliseconds)) waitReadbackMs=\(String(format: "%.2f", blockingMilliseconds)) lighting=\(String(format: "%.3f", lightingFactor)) apertureRaw=\(String(format: "%.3f", contour.innerOpeningRatio)) apertureRendered=\(String(format: "%.3f", contour.effectiveInnerOpeningRatio)) apertureBlend=\(String(format: "%.2f", smoothApertureOpening))"
-        )
-        return LipTexture(
-            image: UIImage(
-                cgImage: diffuseCGImage,
-                scale: renderScale,
-                orientation: .up
-            ),
-            opacityImage: UIImage(
-                cgImage: opacityCGImage,
-                scale: renderScale,
-                orientation: .up
-            )
-        )
+                    self.recordRuntimeSuccess()
+                    let gpuMilliseconds = completedBuffer.gpuEndTime > completedBuffer.gpuStartTime ?
+                        (completedBuffer.gpuEndTime - completedBuffer.gpuStartTime) * 1000 : 0
+                    let readbackMilliseconds = (CACurrentMediaTime() - completedAt) * 1000
+                    LipDebugLog.throttled(
+                        "lip_metal_stats",
+                        interval: 0.6,
+                        "lip_metal frame size=\(pixelWidth)x\(pixelHeight) gpuMs=\(String(format: "%.2f", gpuMilliseconds)) completionMs=\(String(format: "%.2f", (completedAt - startedAt) * 1000)) readbackMs=\(String(format: "%.2f", readbackMilliseconds)) async=true lighting=\(String(format: "%.3f", lightingFactor)) referenceLuma=\(String(format: "%.3f", referenceLipLuminance)) shineWeight=\(String(format: "%.2f", riseWeight))/\(String(format: "%.2f", releaseWeight)) motion=\(String(format: "%.3f", motionDelta)) apertureRaw=\(String(format: "%.3f", contour.innerOpeningRatio)) apertureRendered=\(String(format: "%.3f", contour.effectiveInnerOpeningRatio)) apertureBlend=\(String(format: "%.2f", smoothApertureOpening))"
+                    )
+                    completion(LipTexture(
+                        image: UIImage(
+                            cgImage: diffuseCGImage,
+                            scale: renderScale,
+                            orientation: .up
+                        ),
+                        opacityImage: UIImage(
+                            cgImage: opacityCGImage,
+                            scale: renderScale,
+                            orientation: .up
+                        )
+                    ))
+                }
+            }
+        }
+        commandBuffer.commit()
     }
 
 #if DEBUG
@@ -1542,8 +2083,34 @@ final class MetalLipColorCompositor {
             return context.device.makeTexture(descriptor: descriptor)
         }
 
-        guard let color = makeTexture(usage: [.renderTarget, .shaderRead]),
-              let output = makeTexture(usage: [.shaderRead, .shaderWrite]),
+        guard let color = makeTexture(
+                pixelFormat: .rgba16Float,
+                usage: [.renderTarget, .shaderRead]
+              ),
+              let currentShine = makeTexture(
+                pixelFormat: .r16Float,
+                usage: [.renderTarget, .shaderRead]
+              ),
+              let stabilizedShine = makeTexture(
+                pixelFormat: .r16Float,
+                usage: [.shaderRead, .shaderWrite]
+              ),
+              let gatedShine = makeTexture(
+                pixelFormat: .r16Float,
+                usage: [.shaderRead, .shaderWrite]
+              ),
+              let shineHistory = makeTexture(
+                pixelFormat: .r16Float,
+                usage: [.shaderRead]
+              ),
+              let shadedColor = makeTexture(
+                pixelFormat: .rgba16Float,
+                usage: [.shaderRead, .shaderWrite]
+              ),
+              let output = makeTexture(
+                pixelFormat: .rgba16Float,
+                usage: [.shaderRead, .shaderWrite]
+              ),
               let horizontalBlur = makeTexture(
                 pixelFormat: .r16Float,
                 usage: [.shaderRead, .shaderWrite]
@@ -1559,6 +2126,11 @@ final class MetalLipColorCompositor {
             return nil
         }
         color.label = "VirtualMakeup.LipColor"
+        currentShine.label = "VirtualMakeup.LipCurrentShine"
+        stabilizedShine.label = "VirtualMakeup.LipStabilizedShine"
+        gatedShine.label = "VirtualMakeup.LipGatedShine"
+        shineHistory.label = "VirtualMakeup.LipShineHistory"
+        shadedColor.label = "VirtualMakeup.LipShadedColor"
         output.label = "VirtualMakeup.LipOutput"
         horizontalBlur.label = "VirtualMakeup.LipHorizontalBlur"
         softenedOutput.label = "VirtualMakeup.LipSoftenedOutput"
@@ -1567,13 +2139,135 @@ final class MetalLipColorCompositor {
             width: width,
             height: height,
             color: color,
+            currentShine: currentShine,
+            stabilizedShine: stabilizedShine,
+            gatedShine: gatedShine,
+            shineHistory: shineHistory,
+            shadedColor: shadedColor,
             output: output,
             horizontalBlur: horizontalBlur,
             softenedOutput: softenedOutput,
             blurGate: blurGate
         )
         context.renderTargets = targets
+        invalidateShineHistory()
         return targets
+    }
+
+    private static func referenceLipLuminance(
+        pixelBuffer: CVPixelBuffer,
+        vertices: [Vertex]
+    ) -> Float? {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) ==
+                kCVPixelFormatType_32BGRA,
+              vertices.count == CanonicalLipGeometry.attentionLipIndices.count,
+              CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) ==
+                kCVReturnSuccess else {
+            return nil
+        }
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return nil
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        var luminances: [Float] = []
+        luminances.reserveCapacity(vertices.count / 2)
+
+        for (offset, landmarkIndex) in
+            CanonicalLipGeometry.attentionLipIndices.enumerated() {
+            // Outer vertices sample the feather carrier and inner vertices can
+            // touch the mouth aperture. The two support rings are the most
+            // stable representation of the actual lip surface.
+            guard !CanonicalLipGeometry.isOuterLipIndex(landmarkIndex),
+                  !CanonicalLipGeometry.isInnerLipIndex(landmarkIndex) else {
+                continue
+            }
+            let sourceUV = vertices[offset].sourceUV
+            let x = min(
+                max(Int((sourceUV.x * Float(width)).rounded(.down)), 0),
+                width - 1
+            )
+            let y = min(
+                max(Int((sourceUV.y * Float(height)).rounded(.down)), 0),
+                height - 1
+            )
+            let pixel = baseAddress
+                .advanced(by: y * bytesPerRow + x * 4)
+                .assumingMemoryBound(to: UInt8.self)
+            let red = Float(pixel[2]) / 255
+            let green = Float(pixel[1]) / 255
+            let blue = Float(pixel[0]) / 255
+            let perceptualLuma = red * 0.299 + green * 0.587 + blue * 0.114
+            let maximum = max(red, max(green, blue))
+            let minimum = min(red, min(green, blue))
+            let saturation = maximum > 0.001 ?
+                (maximum - minimum) / maximum : 0
+            guard !(perceptualLuma > 0.64 && saturation < 0.22) else {
+                continue
+            }
+
+            func linear(_ component: Float) -> Float {
+                component <= 0.04045 ?
+                    component / 12.92 :
+                    pow((component + 0.055) / 1.055, 2.4)
+            }
+            let luminance = linear(red) * 0.2126 +
+                linear(green) * 0.7152 +
+                linear(blue) * 0.0722
+            if luminance.isFinite, luminance > 0.001 {
+                luminances.append(luminance)
+            }
+        }
+
+        guard luminances.count >= 8 else {
+            return nil
+        }
+        luminances.sort()
+        let percentileIndex = min(
+            max(Int((Float(luminances.count - 1) * 0.65).rounded()), 0),
+            luminances.count - 1
+        )
+        return luminances[percentileIndex]
+    }
+
+    private func stabilizedReferenceLipLuminance(_ current: Float?, generation: UInt64) -> Float? {
+        guard let current, current.isFinite, current > 0.001 else {
+            return nil
+        }
+        temporalStateLock.lock()
+        defer {
+            temporalStateLock.unlock()
+        }
+
+        guard temporalGeneration == generation else { return nil }
+        let next: Float
+        if let previous = smoothedReferenceLipLuminance {
+            let exposureStops = abs(log2(current / max(previous, 0.001)))
+            let currentWeight: Float = exposureStops > 0.70 ? 0.58 : 0.22
+            next = previous + (current - previous) * currentWeight
+        } else {
+            next = current
+        }
+        smoothedReferenceLipLuminance = next
+        return next
+    }
+
+    private func shineHistoryIsValid() -> Bool {
+        temporalStateLock.lock()
+        let isValid = isShineHistoryValid
+        temporalStateLock.unlock()
+        return isValid
+    }
+
+    private func invalidateShineHistory() {
+        temporalStateLock.lock()
+        isShineHistoryValid = false
+        temporalStateLock.unlock()
     }
 
     private func recordRuntimeFailure(_ reason: String) {
@@ -1604,9 +2298,15 @@ final class MetalLipColorCompositor {
                 .enumerated()
                 .map { ($0.element, UInt16($0.offset)) }
         )
+        let samplingTriangles = CanonicalLipGeometry.lipMeshTriangles +
+            CanonicalLipGeometry.innerFillTriangles
         var indices: [UInt16] = []
-        indices.reserveCapacity(CanonicalLipGeometry.lipMeshTriangles.count * 3)
-        for triangle in CanonicalLipGeometry.lipMeshTriangles {
+        indices.reserveCapacity(samplingTriangles.count * 3)
+        // Rasterize the aperture carrier as well as the visible lip annulus.
+        // Its alpha stays controlled by the signed-distance mask, but exposed
+        // wet-line pixels now have direct camera-aware colour instead of a
+        // fragile nearest-neighbour recovery from the lip surface.
+        for triangle in samplingTriangles {
             guard let first = indexByLandmark[triangle.0],
                   let second = indexByLandmark[triangle.1],
                   let third = indexByLandmark[triangle.2] else {

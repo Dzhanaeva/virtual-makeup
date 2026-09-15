@@ -27,15 +27,17 @@ final class LipMeshRenderer {
         init?(device: MTLDevice,
               vertices: [MeshVertex],
               indices: [Int32],
-              material: SCNMaterial) {
+              materials: [SCNMaterial]) {
             guard !vertices.isEmpty,
                   !indices.isEmpty,
-                  indices.count.isMultiple(of: 3) else {
+                  indices.count.isMultiple(of: 3),
+                  !materials.isEmpty else {
                 return nil
             }
             deviceRegistryID = device.registryID
             landmarkIndices = vertices.map(\.index)
-            triangleCount = indices.count / 3
+            let primitiveCount = indices.count / 3
+            triangleCount = primitiveCount
 
             let textureCoordinates = vertices.map {
                 CGPoint(x: $0.uv.x, y: 1 - $0.uv.y)
@@ -45,12 +47,14 @@ final class LipMeshRenderer {
                 bytes: indices,
                 count: indices.count * MemoryLayout<Int32>.size
             )
-            let element = SCNGeometryElement(
-                data: indexData,
-                primitiveType: .triangles,
-                primitiveCount: triangleCount,
-                bytesPerIndex: MemoryLayout<Int32>.size
-            )
+            let elements = materials.map { _ in
+                SCNGeometryElement(
+                    data: indexData,
+                    primitiveType: .triangles,
+                    primitiveCount: primitiveCount,
+                    bytesPerIndex: MemoryLayout<Int32>.size
+                )
+            }
 
             var buffers: [MTLBuffer] = []
             var geometries: [SCNGeometry] = []
@@ -74,9 +78,9 @@ final class LipMeshRenderer {
                 )
                 let geometry = SCNGeometry(
                     sources: [vertexSource, textureSource],
-                    elements: [element]
+                    elements: elements
                 )
-                geometry.materials = [material]
+                geometry.materials = materials
                 buffers.append(buffer)
                 geometries.append(geometry)
             }
@@ -110,6 +114,7 @@ final class LipMeshRenderer {
     private let debugMeshNode = SCNNode()
     private let debugFrameNode = SCNNode()
     private let lipMaterial = SCNMaterial()
+    private let linerMaterial = SCNMaterial()
     private let debugOuterMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemGreen)
     private let debugInnerMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemCyan)
     private let debugUpperMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemRed)
@@ -117,10 +122,12 @@ final class LipMeshRenderer {
     private let debugFrameMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemPink)
     private var occlusionNode: SCNNode?
     private var lastTextureImage: UIImage?
+    private var lastLinerOpacityImage: UIImage?
     private let debugLinesEnabled = false
     private var lastLightingFactor: CGFloat = 1
     private var openMouthGeometryCache: DynamicSurfaceGeometryCache?
     private var requestedOpacity: CGFloat = 0.99
+    private var requestedLinerOpacity: CGFloat = 0.76
     private var maskVisibility: CGFloat = 0
     private var lastMaskVisibilityUpdateTime: CFTimeInterval?
     private var unavailableSince: CFTimeInterval?
@@ -172,6 +179,29 @@ final class LipMeshRenderer {
         lipMaterial.transparent.textureComponents = .alpha
         lipMaterial.multiply.contents = UIColor.white
         lipMaterial.multiply.intensity = 1
+
+        linerMaterial.lightingModel = .constant
+        linerMaterial.blendMode = .alpha
+        linerMaterial.transparencyMode = .aOne
+        linerMaterial.isDoubleSided = true
+        linerMaterial.writesToDepthBuffer = false
+        linerMaterial.readsFromDepthBuffer = false
+        linerMaterial.diffuse.contents = UIColor(
+            red: 0.47,
+            green: 0.16,
+            blue: 0.19,
+            alpha: 1
+        )
+        linerMaterial.diffuse.textureComponents = [.red, .green, .blue]
+        linerMaterial.transparent.textureComponents = .alpha
+        for property in [linerMaterial.diffuse, linerMaterial.transparent] {
+            property.mappingChannel = 0
+            property.magnificationFilter = .linear
+            property.minificationFilter = .linear
+            property.mipFilter = .none
+            property.wrapS = .clamp
+            property.wrapT = .clamp
+        }
     }
 
     func updateOpacity(_ opacity: Double) {
@@ -179,6 +209,12 @@ final class LipMeshRenderer {
         // visible end, retain a little camera detail instead of becoming a
         // fully opaque vector layer.
         requestedOpacity = CGFloat(max(0, min(opacity, 0.99)))
+        applyEffectiveOpacity()
+    }
+
+    func updateLiner(color: UIColor, opacity: Double) {
+        linerMaterial.diffuse.contents = color.withAlphaComponent(1)
+        requestedLinerOpacity = CGFloat(max(0, min(opacity, 1)))
         applyEffectiveOpacity()
     }
 
@@ -272,6 +308,10 @@ final class LipMeshRenderer {
             lipMaterial.transparent.contents = texture.opacityImage
             lastTextureImage = texture.image
         }
+        if lastLinerOpacityImage !== texture.linerOpacityImage {
+            linerMaterial.transparent.contents = texture.linerOpacityImage
+            lastLinerOpacityImage = texture.linerOpacityImage
+        }
         lipMaterial.readsFromDepthBuffer = false
         lipNode.geometry = geometry
         lipNode.isHidden = false
@@ -339,8 +379,10 @@ final class LipMeshRenderer {
     func clearAll() {
         clearLip()
         lastTextureImage = nil
+        lastLinerOpacityImage = nil
         lipMaterial.diffuse.contents = nil
         lipMaterial.transparent.contents = nil
+        linerMaterial.transparent.contents = nil
     }
 
     private func updateMaskVisibility(
@@ -372,6 +414,7 @@ final class LipMeshRenderer {
 
     private func applyEffectiveOpacity() {
         lipMaterial.transparency = requestedOpacity * maskVisibility
+        linerMaterial.transparency = requestedLinerOpacity * maskVisibility
     }
 
     private static func makeDebugMaterial(color: UIColor) -> SCNMaterial {
@@ -463,7 +506,7 @@ final class LipMeshRenderer {
                     device: device,
                     vertices: mesh.vertices,
                     indices: mesh.indices,
-                    material: lipMaterial
+                    materials: [lipMaterial, linerMaterial]
                   ) else {
                 LipDebugLog.throttled(
                     "lip_mesh_empty_geometry",

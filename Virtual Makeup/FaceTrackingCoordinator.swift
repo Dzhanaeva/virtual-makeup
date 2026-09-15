@@ -23,6 +23,10 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let color: UIColor
         let opacity: Double
     }
+    private struct PendingLinerStyle {
+        let color: UIColor
+        let opacity: Double
+    }
 
     @Binding private var isFaceDetected: Bool
     weak var sceneView: ARSCNView?
@@ -113,6 +117,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private var smoothedLipLightingFactor: CGFloat = 1
     private var lastLightingUpdateTime: CFTimeInterval = 0
     private var pendingLipOpacity: Double?
+    private var pendingLinerStyle: PendingLinerStyle?
     private var pendingBlushStyle: PendingBlushStyle?
     private var rendererClearIsPending = false
 
@@ -221,7 +226,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
                         opacity: Double,
                         finish: LipFinish,
                         density: LipstickDensity,
-                        texture: LipstickTexture) {
+                        texture: LipstickTexture,
+                        materialProfile: LipMaterialProfile,
+                        shadingDebugMode: LipShadingDebugMode) {
         rendererStateLock.lock()
         pendingLipOpacity = opacity
         rendererStateLock.unlock()
@@ -229,7 +236,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             color: color,
             finish: finish,
             density: density,
-            texture: texture
+            texture: texture,
+            materialProfile: materialProfile,
+            shadingDebugMode: shadingDebugMode
         ) else {
             return
         }
@@ -239,6 +248,12 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     func updateBlush(color: UIColor, opacity: Double) {
         rendererStateLock.lock()
         pendingBlushStyle = PendingBlushStyle(color: color, opacity: opacity)
+        rendererStateLock.unlock()
+    }
+
+    func updateLipLiner(color: UIColor, opacity: Double) {
+        rendererStateLock.lock()
+        pendingLinerStyle = PendingLinerStyle(color: color, opacity: opacity)
         rendererStateLock.unlock()
     }
 
@@ -2738,7 +2753,9 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private func enqueueTextureRender(_ request: LipTextureRequest) {
         textureStateLock.lock()
         if isRenderingTexture {
-            pendingTextureRequest = request
+            if pendingTextureRequest.map({ request.requestID > $0.requestID }) ?? true {
+                pendingTextureRequest = request
+            }
             textureStateLock.unlock()
             return
         }
@@ -2835,7 +2852,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
 
     private func renderTextureRequest(_ request: LipTextureRequest) {
         let textureStart = CACurrentMediaTime()
-        let texture = lipTextureRenderer.makeTexture(
+        lipTextureRenderer.makeTexture(
             contour: request.contour,
             pixelBuffer: request.pixelBuffer,
             imageSize: request.imageSize,
@@ -2844,9 +2861,21 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             excludesInnerMouth: request.excludesInnerMouth,
             lightingFactor: request.lightingFactor,
             lowLatency: request.lowLatency,
-            motionDelta: request.motionDelta
-        )
-        textureFPS.tick(workMilliseconds: (CACurrentMediaTime() - textureStart) * 1000)
+            motionDelta: request.motionDelta,
+            completionQueue: textureQueue
+        ) { [weak self] texture in
+            self?.finishTextureRequest(
+                request,
+                texture: texture,
+                startedAt: textureStart
+            )
+        }
+    }
+
+    private func finishTextureRequest(_ request: LipTextureRequest,
+                                      texture: LipTexture?,
+                                      startedAt: CFTimeInterval) {
+        textureFPS.tick(workMilliseconds: (CACurrentMediaTime() - startedAt) * 1000)
 
         let isTracked = currentTrackedFaceAnchor()
         let hasFreshShape = hasFreshLipShape()
@@ -5666,9 +5695,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private func applyPendingRendererState() {
         rendererStateLock.lock()
         let lipOpacity = pendingLipOpacity
+        let linerStyle = pendingLinerStyle
         let blushStyle = pendingBlushStyle
         let shouldClear = rendererClearIsPending
         pendingLipOpacity = nil
+        pendingLinerStyle = nil
         pendingBlushStyle = nil
         rendererClearIsPending = false
         rendererStateLock.unlock()
@@ -5679,6 +5710,12 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }
         if let lipOpacity {
             lipMeshRenderer.updateOpacity(lipOpacity)
+        }
+        if let linerStyle {
+            lipMeshRenderer.updateLiner(
+                color: linerStyle.color,
+                opacity: linerStyle.opacity
+            )
         }
         if let blushStyle {
             blushRenderer.updateStyle(

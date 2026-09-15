@@ -15,6 +15,10 @@ struct FaceTrackingView: UIViewRepresentable {
     var lipFinish: LipFinish
     var lipDensity: LipstickDensity
     var lipTexture: LipstickTexture
+    var lipMaterialProfile: LipMaterialProfile
+    var lipShadingDebugMode: LipShadingDebugMode
+    var linerColor: UIColor
+    var linerOpacity: Double
     var blushColor: UIColor
     var blushOpacity: Double
 
@@ -37,9 +41,12 @@ struct FaceTrackingView: UIViewRepresentable {
             opacity: lipOpacity,
             finish: lipFinish,
             density: lipDensity,
-            texture: lipTexture
+            texture: lipTexture,
+            materialProfile: lipMaterialProfile,
+            shadingDebugMode: lipShadingDebugMode
         )
         context.coordinator.updateBlush(color: blushColor, opacity: blushOpacity)
+        context.coordinator.updateLipLiner(color: linerColor, opacity: linerOpacity)
         context.coordinator.updateViewport(
             size: view.bounds.size,
             scale: view.traitCollection.displayScale,
@@ -56,9 +63,12 @@ struct FaceTrackingView: UIViewRepresentable {
             opacity: lipOpacity,
             finish: lipFinish,
             density: lipDensity,
-            texture: lipTexture
+            texture: lipTexture,
+            materialProfile: lipMaterialProfile,
+            shadingDebugMode: lipShadingDebugMode
         )
         context.coordinator.updateBlush(color: blushColor, opacity: blushOpacity)
+        context.coordinator.updateLipLiner(color: linerColor, opacity: linerOpacity)
         context.coordinator.updateViewport(
             size: view.bounds.size,
             scale: view.window?.screen.scale ?? view.traitCollection.displayScale,

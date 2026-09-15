@@ -9,9 +9,9 @@ configuration, the code and configuration win. Update this file after reconcilin
 
 ## Project overview
 
-Virtual Makeup is a SwiftUI iOS app for real-time virtual lipstick preview. The app opens an
+Virtual Makeup is a SwiftUI iOS app for real-time virtual lipstick and lip liner preview. The app opens an
 AR camera view, detects a face with MediaPipe Tasks Vision, tracks lip landmarks, builds a
-SceneKit lip mesh, and renders a generated lipstick texture over the user's mouth.
+SceneKit lip mesh, and renders generated lipstick and liner textures over the user's mouth.
 
 Current core technologies:
 
@@ -19,8 +19,10 @@ Current core technologies:
 - `UIViewRepresentable` bridge for `ARSCNView`.
 - ARKit face tracking and SceneKit rendering for camera, face anchor, occlusion, and lip mesh.
 - MediaPipe Tasks Vision `FaceLandmarker` for live lip landmark detection.
-- Metal and Metal Performance Shaders for camera-aware lipstick colour, texture preservation,
-  and the feathered lip alpha mask; the legacy CPU compositor is fallback-only.
+- Metal and Metal Performance Shaders for camera-aware lipstick colour, linear-RGB light and
+  shadow processing with sRGB input/output, texture preservation, a temporally stabilized
+  camera-derived shine mask, and the feathered lip alpha mask; the legacy CPU compositor is
+  fallback-only and follows the same colour-space and material-signal contract.
 - CocoaPods for `MediaPipeTasksVision`.
 - Bundled model/assets: `face_landmarker.task`, `face_model_with_iris.obj`, and
   `Assets.xcassets`.
@@ -30,14 +32,18 @@ Current core technologies:
 ## Important files
 
 - `Virtual Makeup/Virtual_MakeupApp.swift`: SwiftUI app entry point.
-- `Virtual Makeup/ContentView.swift`: top-level UI, face detection status, and lipstick presets.
+- `Virtual Makeup/ContentView.swift`: top-level UI, face detection status, lipstick presets, and
+  the temporary lip liner product/shade catalogue.
 - `Virtual Makeup/FaceTrackingView.swift`: thin SwiftUI/`ARSCNView` bridge.
 - `Virtual Makeup/FaceTrackingCoordinator.swift`: ARKit and MediaPipe callback orchestration,
   tracking state, smoothing, prediction, and render request scheduling.
+- `Virtual Makeup/LipstickTypes.swift`: product metadata and resolved per-product material profiles
+  shared by the Metal and CPU compositors.
 - `Virtual Makeup/LipModels.swift` and `CanonicalLipGeometry.swift`: lip/face geometry data,
   coordinate transforms, canonical topology, and mesh lookup data.
 - `Virtual Makeup/LipMeshRenderer.swift`, `LipTextureRenderer.swift`, and
-  `MetalLipColorCompositor.swift`: SceneKit geometry and camera-aware lipstick rendering.
+  `MetalLipColorCompositor.swift`: SceneKit geometry, camera-aware lipstick rendering, and the
+  independent soft lip liner material.
 - `Virtual Makeup/BlushRenderer.swift`: SceneKit blush rendering.
 - `Virtual Makeup/VirtualMakeup-Bridging-Header.h`: Objective-C bridging header configured in
   the Xcode project.
@@ -89,7 +95,8 @@ python3 ml-training/scripts/smoke_test.py
 - Keep real-time paths small and predictable. Do not block ARKit renderer callbacks, AR session
   callbacks, or MediaPipe delegate queues with heavy synchronous work.
 - Preserve the existing queue/lock model unless replacing it with a clearly safer concurrency
-  design. Shared mutable render, texture, detection, and viewport state must remain synchronized.
+  design. `textureQueue` owns one texture request until its GPU completion and readback finish; pending
+  texture work is coalesced. Never reuse compositor targets before completion. Shared mutable render, texture, detection, and viewport state must remain synchronized.
 - UI state updates from background callbacks must happen on the main thread or main actor.
 - Prefer extracting cohesive private types from `FaceTrackingView.swift` over adding more unrelated
   responsibility to `Coordinator`.
@@ -122,6 +129,10 @@ python3 ml-training/scripts/smoke_test.py
   and superseded-request checks when changing texture rendering.
 - Keep the Metal lip target compact, retain source `CVMetalTexture` objects until command-buffer
   completion, and preserve the failure-counted CPU fallback when changing the compositor.
+  The compositor completes asynchronously on `textureQueue`; it must not call
+  `waitUntilCompleted`. Temporal resets invalidate outstanding shine-history completions.
+- Keep UIKit screen/window reads in SwiftUI or the view's main-thread layout callbacks; cache
+  the resulting viewport/display values for SceneKit's rendering queue.
 - Clear SceneKit nodes and tracking state when anchors are removed, sessions stop, tracking is lost,
   or detection becomes stale.
 

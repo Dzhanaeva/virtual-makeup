@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     private enum MakeupTool: String, CaseIterable, Identifiable {
         case lipstick = "Помада"
+        case lipLiner = "Карандаш"
         case blush = "Румяна"
 
         var id: String { rawValue }
@@ -25,6 +26,7 @@ struct ContentView: View {
         let finish: LipFinish
         let density: LipstickDensity
         let texture: LipstickTexture
+        let materialProfile: LipMaterialProfile
         let shades: [LipShade]
 
         init(
@@ -35,6 +37,7 @@ struct ContentView: View {
             finish: LipFinish,
             density: LipstickDensity,
             texture: LipstickTexture,
+            materialProfile: LipMaterialProfile? = nil,
             shades: [LipShade]
         ) {
             self.id = id
@@ -44,6 +47,11 @@ struct ContentView: View {
             self.finish = finish
             self.density = density
             self.texture = texture
+            self.materialProfile = materialProfile ?? .standard(
+                finish: finish,
+                density: density,
+                texture: texture
+            )
             self.shades = shades
         }
     }
@@ -53,18 +61,40 @@ struct ContentView: View {
         let color: UIColor
     }
 
+    private struct LinerShade: Identifiable {
+        let productID: String
+        let name: String
+        let color: UIColor
+
+        var id: String { productID }
+    }
+
+    private struct LinerProduct: Identifiable {
+        let id: String
+        let placeholderNumber: Int
+        let name: String
+        let shades: [LinerShade]
+    }
+
     @State private var isFaceDetected = false
     @State private var selectedTool: MakeupTool = .lipstick
     @State private var selectedProductIndex = 0
     @State private var selectedShadeIndex = 0
     @State private var isShowingLipProductDetails = false
     @State private var selectedBlushIndex = 0
+    @State private var selectedLinerProductIndex = 0
+    @State private var selectedLinerShadeIndex = 0
+    @State private var isShowingLinerProductDetails = false
     // Real lipstick never fully replaces the captured lip colour. Start with
     // a translucent layer and keep a little camera detail even at the upper
     // end of the user control.
     @State private var lipstickOpacity = 1.0
     @State private var blushOpacity = 0.55
+    @State private var linerOpacity = 0.76
     @State private var isShowingOriginal = false
+#if DEBUG
+    @State private var lipShadingDebugMode: LipShadingDebugMode = .off
+#endif
 
     private let lipProducts: [LipProduct] = [
         LipProduct(
@@ -78,21 +108,22 @@ struct ContentView: View {
                 LipShade(
                     productID: "VM-1001-131",
                     name: "131",
-                    color: LipstickColor(sourceSRGBHex: 0xC3776A)
+                    color: LipstickColor(sourceSRGBHex: 0xD07266)
                 ),
                 LipShade(
                     productID: "VM-1001-518",
                     name: "518",
-                    color: LipstickColor(sourceSRGBHex: 0xD26B6B)
+                    color: LipstickColor(sourceSRGBHex: 0xE16468)
                 ),
                 LipShade(
                     productID: "VM-1001-006",
                     name: "06",
-                    color: LipstickColor(sourceSRGBHex: 0xAF5655)
+                    color: LipstickColor(sourceSRGBHex: 0xBC4F52)
                 )
             ]
         ),
         LipProduct(
+            
             id: "dior-rouge-dior-satin",
             placeholderNumber: 2,
             name: "Dior Rouge Dior Satin",
@@ -118,12 +149,12 @@ struct ContentView: View {
                 LipShade(
                     productID: "VM-1003-770",
                     name: "770",
-                    color: LipstickColor(sourceSRGBHex: 0xAC2936)
+                    color: LipstickColor(sourceSRGBHex: 0xB90E2E)
                 ),
                 LipShade(
                     productID: "VM-1003-360",
                     name: "360",
-                    color: LipstickColor(sourceSRGBHex: 0xA35B4C)
+                    color: LipstickColor(sourceSRGBHex: 0xAB5244)
                 )
             ]
         ),
@@ -141,10 +172,22 @@ struct ContentView: View {
                     color: LipstickColor(sourceSRGBHex: 0x7E1331)
                 ),
                 LipShade(
+                    productID: "VM-1004-BL",
+                    name: "Burning Love ЗЯ",
+                    color: LipstickColor(sourceSRGBHex: 0x7A2B40)
+                ),
+                
+                LipShade(
                     productID: "VM-1004-MM",
                     name: "Marrakeshmere",
-                    color: LipstickColor(sourceSRGBHex: 0x782C24)
-                )
+                    color: LipstickColor(sourceSRGBHex: 0x8B302B)
+                ),
+                
+                LipShade(
+                    productID: "VM-1004-MM",
+                    name: "Marrakeshmere ЗЯ",
+                    color: LipstickColor(sourceSRGBHex: 0x853832)
+                ),
             ]
         ),
         LipProduct(
@@ -162,6 +205,87 @@ struct ContentView: View {
                 )
             ]
         ),
+        
+        LipProduct(
+            id: "bobby-brown-satin-lipstick",
+            placeholderNumber: 5,
+            name: "Bobby Brown Satin Lipstick",
+            finish: .satin,
+            density: .medium,
+            texture: .creamy,
+            shades: [
+                LipShade(
+                    productID: "VM-1005-BB",
+                    name: "Brave",
+                    color: LipstickColor(sourceSRGBHex: 0x87473F)
+                )
+            ]
+        ),
+        
+        LipProduct(
+            id: "nrav-lipstick",
+            placeholderNumber: 5,
+            name: "Nrav Lipstick",
+            finish: .matte,
+            density: .high,
+            texture: .creamy,
+            shades: [
+                LipShade(
+                    productID: "VM-1005-BB",
+                    name: "05 Бежевыый",
+                    color: LipstickColor(sourceSRGBHex: 0xD68B79)
+                )
+            ]
+        ),
+        
+        LipProduct(
+            id: "estee-lauder-satin-lipstick",
+            placeholderNumber: 5,
+            name: "Estee Lauder Satin Lipstick",
+            finish: .satin,
+            density: .high,
+            texture: .creamy,
+            shades: [
+                LipShade(
+                    productID: "VM-1005-EL",
+                    name: "340",
+                    color: LipstickColor(sourceSRGBHex: 0xBA273A)
+                )
+            ]
+        ),
+        
+        LipProduct(
+            id: "kilian-matte-lipstick",
+            placeholderNumber: 5,
+            name: "Kilian Paris Matte Lipstick",
+            finish: .matte,
+            density: .high,
+            texture: .creamy,
+            shades: [
+                LipShade(
+                    productID: "VM-1005-KP",
+                    name: "240",
+                    color: LipstickColor(sourceSRGBHex: 0x8E212D)
+                )
+            ]
+        ),
+
+        LipProduct(
+            id: "make-up-factory-satin-lipstick",
+            placeholderNumber: 5,
+            name: "Make Up Factory Satin Lipstick",
+            finish: .satin,
+            density: .medium,
+            texture: .creamy,
+            shades: [
+                LipShade(
+                    productID: "VM-1005-MF",
+                    name: "100",
+                    color: LipstickColor(sourceSRGBHex: 0xDC8367)
+                )
+            ]
+        ),
+        
         LipProduct(
             id: "clarins-satin-lipstick",
             placeholderNumber: 6,
@@ -192,7 +316,7 @@ struct ContentView: View {
                 )
             ]
         ),
-        
+
         LipProduct(
             id: "dior-lip-gloss",
             placeholderNumber: 8,
@@ -213,7 +337,7 @@ struct ContentView: View {
                 )
             ]
         ),
-        
+
         LipProduct(
             id: "dior-lip-gloss-creamy",
             placeholderNumber: 9,
@@ -308,6 +432,65 @@ struct ContentView: View {
                 )
             ]
         ),
+
+        LipProduct(
+            id: "influence-lip-balm",
+            placeholderNumber: 12,
+            name: "Influence Lipstick Balm",
+            finish: .gloss,
+            density: .medium,
+            texture: .liquid,
+            shades: [
+                LipShade(
+                    productID: "VM-1009-014",
+                    name: "14",
+                    color: LipstickColor(sourceSRGBHex: 0x90372B)
+                )
+            ]
+        ),
+
+        LipProduct(
+            id: "guerlain-bee-glow",
+            placeholderNumber: 13,
+            name: "GUERLAIN, kiss bee glow oil",
+            finish: .oil,
+            density: .low,
+            texture: .liquid,
+            shades: [
+                LipShade(
+                    productID: "VM-1009-309",
+                    name: "309",
+                    color: LipstickColor(sourceSRGBHex: 0xEE6563)
+                ),
+
+                LipShade(
+                    productID: "VM-1009-775",
+                    name: "775",
+                    color: LipstickColor(sourceSRGBHex: 0xF50F14)
+                )
+            ]
+        ),
+
+        LipProduct(
+            id: "ok-beauty-tint",
+            placeholderNumber: 14,
+            name: "OK Beauty",
+            finish: .tint,
+            density: .medium,
+            texture: .liquid,
+            shades: [
+                LipShade(
+                    productID: "VM-1009-234",
+                    name: "Valkyrie",
+                    color: LipstickColor(sourceSRGBHex: 0x78293D)
+                ),
+                LipShade(
+                    productID: "VM-1009-235",
+                    name: "Safari",
+                    color: LipstickColor(sourceSRGBHex: 0xD78385)
+                )
+            ]
+        ),
     ]
 
     private let blushPresets: [BlushPreset] = [
@@ -315,6 +498,38 @@ struct ContentView: View {
         BlushPreset(name: "Персиковый", color: UIColor(red: 0.96, green: 0.50, blue: 0.38, alpha: 1)),
         BlushPreset(name: "Пыльная роза", color: UIColor(red: 0.75, green: 0.34, blue: 0.40, alpha: 1)),
         BlushPreset(name: "Коралловый", color: UIColor(red: 0.93, green: 0.36, blue: 0.32, alpha: 1))
+    ]
+
+    private let linerProducts: [LinerProduct] = [
+        LinerProduct(
+            id: "divage-lip-pencil",
+            placeholderNumber: 1,
+            name: "Divage Lip Pencil",
+            shades: [
+                LinerShade(
+                    productID: "VM-LP-1001-RW",
+                    name: "09 Терракотовый",
+                    color: UIColor(red: 132/255, green: 63/255, blue: 51/255, alpha: 1)
+                ),
+                LinerShade(
+                    productID: "VM-LP-1001-WN",
+                    name: "Тёплый нюд",
+                    color: UIColor(red: 148/255, green: 27/255, blue: 43/255, alpha: 1)
+                )
+            ]
+        ),
+        LinerProduct(
+            id: "vivienne-sabo-lip-pencil",
+            placeholderNumber: 2,
+            name: "Vivienne Sabo гелевый",
+            shades: [
+                LinerShade(
+                    productID: "VM-LP-1002-TR",
+                    name: "03 Холодный нюд",
+                    color: UIColor(red: 197/255, green: 131/255, blue: 148/255, alpha: 1)
+                )
+            ]
+        )
     ]
 
     var body: some View {
@@ -326,6 +541,11 @@ struct ContentView: View {
                 lipFinish: selectedLipProduct.finish,
                 lipDensity: selectedLipProduct.density,
                 lipTexture: selectedLipProduct.texture,
+                lipMaterialProfile: selectedLipProduct.materialProfile,
+                lipShadingDebugMode: currentLipShadingDebugMode,
+                linerColor: selectedLinerShade.color,
+                linerOpacity: isShowingOriginal ||
+                    currentLipShadingDebugMode != .off ? 0 : linerOpacity,
                 blushColor: blushPresets[selectedBlushIndex].color,
                 blushOpacity: isShowingOriginal ? 0 : blushOpacity
             )
@@ -404,8 +624,33 @@ struct ContentView: View {
                         .frame(maxWidth: 360)
                         .accessibilityLabel("Интенсивность \(selectedTool.rawValue.lowercased())")
 
+#if DEBUG
+                    if selectedTool == .lipstick {
+                        Toggle(
+                            "Карта собственной светотени",
+                            isOn: Binding(
+                                get: {
+                                    lipShadingDebugMode == .capturedShape
+                                },
+                                set: { isEnabled in
+                                    lipShadingDebugMode = isEnabled ?
+                                        .capturedShape : .off
+                                }
+                            )
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .tint(.yellow)
+                        .accessibilityHint(
+                            "Показывает яркость камеры, которой любой финиш окрашивает каждый участок губ"
+                        )
+                    }
+#endif
+
                     if selectedTool == .lipstick {
                         lipstickProductAndShadePicker
+                    } else if selectedTool == .lipLiner {
+                        linerProductAndShadePicker
                     } else {
                         blushPicker
                     }
@@ -523,12 +768,19 @@ struct ContentView: View {
                                         .fill(Color(shade.color.uiColor))
                                         .frame(width: 40, height: 40)
                                         .overlay(alignment: .topLeading) {
-                                            if selectedLipProduct.finish == .gloss {
+                                            if selectedLipProduct.finish.isWet {
                                                 Capsule()
                                                     .fill(.white.opacity(0.68))
                                                     .frame(width: 17, height: 6)
                                                     .rotationEffect(.degrees(-24))
                                                     .offset(x: 8, y: 8)
+                                                if selectedLipProduct.finish == .oil {
+                                                    Capsule()
+                                                        .fill(.white.opacity(0.52))
+                                                        .frame(width: 10, height: 4)
+                                                        .rotationEffect(.degrees(-24))
+                                                        .offset(x: 20, y: 19)
+                                                }
                                             }
                                         }
                                         .overlay(
@@ -645,6 +897,174 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var linerProductAndShadePicker: some View {
+        if isShowingLinerProductDetails {
+            selectedLinerProductPicker
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+        } else {
+            linerProductCatalog
+                .transition(.opacity.combined(with: .move(edge: .leading)))
+        }
+    }
+
+    private var linerProductCatalog: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Карандаши для губ")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.72))
+                .padding(.horizontal, 4)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    ForEach(linerProducts.indices, id: \.self) { index in
+                        let product = linerProducts[index]
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                selectedLinerProductIndex = index
+                                selectedLinerShadeIndex = 0
+                                isShowingLinerProductDetails = true
+                            }
+                        } label: {
+                            linerProductTile(
+                                product,
+                                isSelected: selectedLinerProductIndex == index
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Карандаш для губ \(product.name)")
+                        .accessibilityAddTraits(
+                            selectedLinerProductIndex == index ? .isSelected : []
+                        )
+                    }
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 3)
+            }
+        }
+    }
+
+    private var selectedLinerProductPicker: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isShowingLinerProductDetails = false
+                }
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(.black.opacity(0.32))
+                    .clipShape(Circle())
+                    .overlay(
+                        Circle().strokeBorder(.white.opacity(0.50), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Вернуться к списку карандашей для губ")
+            .padding(.top, 7)
+
+            linerProductTile(selectedLinerProduct, isSelected: true)
+
+            Rectangle()
+                .fill(.white.opacity(0.20))
+                .frame(width: 1, height: 76)
+                .padding(.horizontal, 2)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("Оттенки")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.72))
+                    Spacer(minLength: 8)
+                    Text("ID: \(selectedLinerShade.productID)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(1)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(selectedLinerProduct.shades.indices, id: \.self) { index in
+                            let shade = selectedLinerProduct.shades[index]
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    selectedLinerShadeIndex = index
+                                }
+                            } label: {
+                                VStack(spacing: 5) {
+                                    Circle()
+                                        .fill(Color(shade.color))
+                                        .frame(width: 40, height: 40)
+                                        .overlay(
+                                            Circle().strokeBorder(
+                                                .white,
+                                                lineWidth: selectedLinerShadeIndex == index ? 3 : 0
+                                            )
+                                        )
+                                        .scaleEffect(selectedLinerShadeIndex == index ? 1.08 : 1)
+
+                                    Text(shade.name)
+                                        .font(.caption2.weight(
+                                            selectedLinerShadeIndex == index ? .semibold : .regular
+                                        ))
+                                        .foregroundStyle(.white.opacity(
+                                            selectedLinerShadeIndex == index ? 1 : 0.78
+                                        ))
+                                        .lineLimit(1)
+
+                                    Text(shade.productID)
+                                        .font(.system(size: 8, design: .monospaced))
+                                        .foregroundStyle(.white.opacity(0.56))
+                                        .lineLimit(1)
+                                }
+                                .frame(width: 88)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(
+                                "Оттенок \(shade.name), ID товара \(shade.productID)"
+                            )
+                            .accessibilityAddTraits(
+                                selectedLinerShadeIndex == index ? .isSelected : []
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+    }
+
+    private func linerProductTile(_ product: LinerProduct,
+                                  isSelected: Bool) -> some View {
+        VStack(spacing: 6) {
+            Circle()
+                .fill(isSelected ? Color.white : Color.black.opacity(0.32))
+                .frame(width: 44, height: 44)
+                .overlay {
+                    Text("\(product.placeholderNumber)")
+                        .font(.headline.monospacedDigit().weight(.bold))
+                        .foregroundStyle(isSelected ? .black : .white)
+                }
+                .overlay(
+                    Circle().strokeBorder(
+                        .white.opacity(0.88),
+                        lineWidth: isSelected ? 3 : 1
+                    )
+                )
+
+            Text(product.name)
+                .font(.caption2.weight(isSelected ? .semibold : .regular))
+                .foregroundStyle(.white.opacity(isSelected ? 1 : 0.76))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.70)
+                .frame(width: 96, height: 28, alignment: .top)
+        }
+    }
+
     private var selectedLipProduct: LipProduct {
         lipProducts[selectedProductIndex]
     }
@@ -653,22 +1073,63 @@ struct ContentView: View {
         selectedLipProduct.shades[selectedShadeIndex]
     }
 
+    private var selectedLinerProduct: LinerProduct {
+        linerProducts[selectedLinerProductIndex]
+    }
+
+    private var selectedLinerShade: LinerShade {
+        selectedLinerProduct.shades[selectedLinerShadeIndex]
+    }
+
     private var activeOpacity: Double {
-        selectedTool == .lipstick ? lipstickOpacity : blushOpacity
+        switch selectedTool {
+        case .lipstick:
+            return lipstickOpacity
+        case .lipLiner:
+            return linerOpacity
+        case .blush:
+            return blushOpacity
+        }
+    }
+
+    private var currentLipShadingDebugMode: LipShadingDebugMode {
+#if DEBUG
+        lipShadingDebugMode
+#else
+        .off
+#endif
     }
 
     private var activeToolTitle: String {
-        guard selectedTool == .lipstick else {
+        switch selectedTool {
+        case .lipstick:
+            return "\(selectedLipProduct.productType.displayName) · \(selectedLipProduct.finish.displayName)"
+        case .lipLiner:
+            return "Карандаш · \(selectedLinerProduct.name)"
+        case .blush:
             return selectedTool.rawValue
         }
-        return "\(selectedLipProduct.productType.displayName) · \(selectedLipProduct.finish.displayName)"
     }
 
     private var activeOpacityBinding: Binding<Double> {
-        selectedTool == .lipstick ? $lipstickOpacity : $blushOpacity
+        switch selectedTool {
+        case .lipstick:
+            return $lipstickOpacity
+        case .lipLiner:
+            return $linerOpacity
+        case .blush:
+            return $blushOpacity
+        }
     }
 
     private var activeOpacityRange: ClosedRange<Double> {
-        selectedTool == .lipstick ? 0.35...1 : 0.0...0.85
+        switch selectedTool {
+        case .lipstick:
+            return 0.35...1
+        case .lipLiner:
+            return 0...1
+        case .blush:
+            return 0...0.85
+        }
     }
 }

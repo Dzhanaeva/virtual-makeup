@@ -599,6 +599,31 @@ enum LipOuterFeatherLayout {
     static let exteriorTransitionPixels: Float = 4.0
 }
 
+enum LipInnerBoundaryLayout {
+    // Define the wet-line reach against the same 96 px reference used by the
+    // Metal mask. The CPU and GPU paths then expose an identical part of the
+    // inner carrier instead of producing different mouth edges after fallback.
+    private static let referenceTextureHeight: CGFloat = 96
+
+    static func solidCoveragePixels(opening: CGFloat) -> CGFloat {
+        let clampedOpening = min(max(opening, 0), 1)
+        return 1.55 - clampedOpening * 1.47
+    }
+
+    static func transitionPixels(opening: CGFloat) -> CGFloat {
+        let clampedOpening = min(max(opening, 0), 1)
+        return 0.75 - clampedOpening * 0.40
+    }
+
+    static func normalizedSolidCoverage(opening: CGFloat) -> CGFloat {
+        solidCoveragePixels(opening: opening) / referenceTextureHeight
+    }
+
+    static func normalizedTransition(opening: CGFloat) -> CGFloat {
+        transitionPixels(opening: opening) / referenceTextureHeight
+    }
+}
+
 enum LipOuterBoundary {
     /// Builds a constant-distance carrier around the detected lip outline.
     /// Directions come from the fixed canonical contour rather than adjacent
