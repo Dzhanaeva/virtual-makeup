@@ -94,6 +94,7 @@ struct ContentView: View {
     @State private var isShowingOriginal = false
 #if DEBUG
     @State private var lipShadingDebugMode: LipShadingDebugMode = .off
+    @State private var showsLandmarks = false
 #endif
 
     private let lipProducts: [LipProduct] = [
@@ -536,6 +537,7 @@ struct ContentView: View {
         ZStack {
             FaceTrackingView(
                 isFaceDetected: $isFaceDetected,
+                showsLandmarks: currentShowsLandmarks,
                 lipColor: selectedLipShade.color,
                 lipOpacity: isShowingOriginal ? 0 : lipstickOpacity,
                 lipFinish: selectedLipProduct.finish,
@@ -625,6 +627,24 @@ struct ContentView: View {
                         .accessibilityLabel("Интенсивность \(selectedTool.rawValue.lowercased())")
 
 #if DEBUG
+                    Toggle("Landmarks MediaPipe", isOn: $showsLandmarks)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .tint(.cyan)
+                        .accessibilityHint(
+                            "Голубые точки показывают лицо, жёлтые — сырые губы MediaPipe, розовые — контур, переданный в рендерер"
+                        )
+
+                    if showsLandmarks {
+                        HStack(spacing: 10) {
+                            debugLegendItem(color: .cyan, title: "лицо")
+                            debugLegendItem(color: .yellow, title: "raw lips")
+                            debugLegendItem(color: .pink, title: "render")
+                        }
+                            .font(.caption2.monospaced().weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+
                     if selectedTool == .lipstick {
                         Toggle(
                             "Карта собственной светотени",
@@ -1099,6 +1119,25 @@ struct ContentView: View {
         .off
 #endif
     }
+
+    private var currentShowsLandmarks: Bool {
+#if DEBUG
+        showsLandmarks
+#else
+        false
+#endif
+    }
+
+#if DEBUG
+    private func debugLegendItem(color: Color,
+                                 title: String) -> some View {
+        HStack(spacing: 3) {
+            Text("●")
+                .foregroundStyle(color)
+            Text(title)
+        }
+    }
+#endif
 
     private var activeToolTitle: String {
         switch selectedTool {

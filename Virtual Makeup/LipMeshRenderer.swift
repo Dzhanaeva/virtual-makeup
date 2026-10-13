@@ -8,6 +8,11 @@ import simd
 import SwiftUI
 import UIKit
 
+enum LipMeshRenderingMode {
+    case faceSurface
+    case screenSpace2D
+}
+
 final class LipMeshRenderer {
     private struct MeshVertex {
         let index: Int
@@ -90,7 +95,8 @@ final class LipMeshRenderer {
 
         func geometry(updating positions: [SIMD3<Float>]) -> SCNGeometry? {
             guard positions.count == landmarkIndices.count,
-                  !buffers.isEmpty else {
+                  !buffers.isEmpty,
+                  let boundingBox = Self.boundingBox(for: positions) else {
                 return nil
             }
             let slot = nextSlot
@@ -102,7 +108,50 @@ final class LipMeshRenderer {
                 }
                 buffers[slot].contents().copyMemory(from: source, byteCount: byteCount)
             }
-            return geometries[slot]
+            let geometry = geometries[slot]
+            // SceneKit cannot infer that an MTLBuffer-backed vertex source
+            // changed. Without an explicit current bound it may keep culling
+            // the mesh after the face briefly leaves the viewport.
+            geometry.boundingBox = boundingBox
+            return geometry
+        }
+
+        private static func boundingBox(
+            for positions: [SIMD3<Float>]
+        ) -> (min: SCNVector3, max: SCNVector3)? {
+            guard let first = positions.first,
+                  first.x.isFinite,
+                  first.y.isFinite,
+                  first.z.isFinite else {
+                return nil
+            }
+
+            var minimum = first
+            var maximum = first
+            for position in positions.dropFirst() {
+                guard position.x.isFinite,
+                      position.y.isFinite,
+                      position.z.isFinite else {
+                    return nil
+                }
+                minimum = simd_min(minimum, position)
+                maximum = simd_max(maximum, position)
+            }
+
+            // The 2D mesh is coplanar. Give its bound a small volume so it
+            // remains robust at the frustum edge and through camera-pose resets.
+            let extent = maximum - minimum
+            let padding = max(
+                max(extent.x, max(extent.y, extent.z)) * 0.05,
+                0.0001
+            )
+            let inset = SIMD3<Float>(repeating: padding)
+            minimum -= inset
+            maximum += inset
+            return (
+                min: SCNVector3(minimum.x, minimum.y, minimum.z),
+                max: SCNVector3(maximum.x, maximum.y, maximum.z)
+            )
         }
     }
 
@@ -126,6 +175,7 @@ final class LipMeshRenderer {
     private let debugLinesEnabled = false
     private var lastLightingFactor: CGFloat = 1
     private var openMouthGeometryCache: DynamicSurfaceGeometryCache?
+    private var screenSpaceGeometryCache: DynamicSurfaceGeometryCache?
     private var requestedOpacity: CGFloat = 0.99
     private var requestedLinerOpacity: CGFloat = 0.76
     private var maskVisibility: CGFloat = 0
@@ -134,6 +184,11 @@ final class LipMeshRenderer {
     private var unavailableStartVisibility: CGFloat = 0
     private static let maskRecoveryDuration: CFTimeInterval = 0.07
     private static let unavailableFadeDuration: CFTimeInterval = 0.10
+    // Normalized SceneKit depth: stay safely beyond the near plane while the
+    // material remains an overlay with depth reads/writes disabled.
+    private static let screenSpaceDepth: Float = 0.01
+
+    private(set) var renderingMode: LipMeshRenderingMode = .screenSpace2D
 
     init() {
         lipNode.name = "lipstick.mesh"
@@ -212,6 +267,14 @@ final class LipMeshRenderer {
         applyEffectiveOpacity()
     }
 
+    func updateRenderingMode(_ mode: LipMeshRenderingMode) {
+        guard renderingMode != mode else {
+            return
+        }
+        renderingMode = mode
+        clearLip()
+    }
+
     func updateLiner(color: UIColor, opacity: Double) {
         linerMaterial.diffuse.contents = color.withAlphaComponent(1)
         requestedLinerOpacity = CGFloat(max(0, min(opacity, 1)))
@@ -283,6 +346,7 @@ final class LipMeshRenderer {
                 contourAge: CFTimeInterval,
                 motionDelta: CGFloat,
                 freshnessVisibility: CGFloat) {
+        attach(to: faceNode)
         let correctedMouthFrame = mouthFrame
 
         guard let geometry = makeGeometry(
@@ -336,6 +400,74 @@ final class LipMeshRenderer {
                 motionDelta: motionDelta
             )
         }
+    }
+
+    func renderScreenLocked(contour: LipContour,
+                            texture: LipTexture,
+                            renderer: SCNSceneRenderer,
+                            sceneRoot: SCNNode?,
+                            contourAge: CFTimeInterval,
+                            motionDelta: CGFloat,
+                            freshnessVisibility: CGFloat) {
+        guard let sceneRoot else {
+            LipDebugLog.throttled(
+                "lip_mesh_2d_no_scene_root",
+                interval: 0.4,
+                "lip_mesh hide reason=screen_space_2d_no_scene_root"
+            )
+            renderUnavailable()
+            return
+        }
+        guard let geometry = makeScreenSpaceGeometry(
+            contour: contour,
+            renderer: renderer
+        ) else {
+            LipDebugLog.throttled(
+                "lip_mesh_2d_no_geometry",
+                interval: 0.4,
+                "lip_mesh hide reason=screen_space_2d_geometry_unavailable"
+            )
+            renderUnavailable()
+            return
+        }
+
+        let isRecovering = lipNode.isHidden || lipNode.geometry == nil || unavailableSince != nil
+        if lipNode.parent !== sceneRoot {
+            lipNode.removeFromParentNode()
+            lipNode.simdTransform = matrix_identity_float4x4
+            sceneRoot.addChildNode(lipNode)
+        }
+        unavailableSince = nil
+        unavailableStartVisibility = 0
+        updateMaskVisibility(
+            target: max(0, min(freshnessVisibility, 1)),
+            now: CACurrentMediaTime()
+        )
+        if lastTextureImage !== texture.image {
+            lipMaterial.diffuse.contents = texture.image
+            lipMaterial.transparent.contents = texture.opacityImage
+            lastTextureImage = texture.image
+        }
+        if lastLinerOpacityImage !== texture.linerOpacityImage {
+            linerMaterial.transparent.contents = texture.linerOpacityImage
+            lastLinerOpacityImage = texture.linerOpacityImage
+        }
+        lipNode.geometry = geometry
+        lipNode.isHidden = false
+        if isRecovering {
+            LipDebugLog.throttled(
+                "lip_mesh_2d_recovered",
+                interval: 0.2,
+                "lip_mesh recovered mode=screen_space_2d visibility=\(Self.fmt(maskVisibility)) opacity=\(Self.fmt(lipMaterial.transparency)) parent=\(lipNode.parent != nil)"
+            )
+        }
+        let bounds = geometry.boundingBox
+        LipDebugLog.throttled(
+            "lip_mesh_2d_alignment",
+            interval: 0.75,
+            "lip_mesh alignment=screen_space_2d age=\(Self.fmt(CGFloat(contourAge))) motion=\(Self.fmt(motionDelta)) visible=\(!lipNode.isHidden) mask=\(Self.fmt(maskVisibility)) opacity=\(Self.fmt(lipMaterial.transparency)) bounds=(\(Self.fmt(CGFloat(bounds.max.x - bounds.min.x)))x\(Self.fmt(CGFloat(bounds.max.y - bounds.min.y)))x\(Self.fmt(CGFloat(bounds.max.z - bounds.min.z))))"
+        )
+        clearDebugLines()
     }
 
     func renderUnavailable() {
@@ -572,6 +704,93 @@ final class LipMeshRenderer {
                 "lip_mesh_screen_lock_geometry_invalid",
                 interval: 0.4,
                 "lip_mesh hide reason=invalid_mediapipe_screen_locked_geometry"
+            )
+            return nil
+        }
+        return geometryCache.geometry(updating: positions)
+    }
+
+    private func makeScreenSpaceGeometry(
+        contour: LipContour,
+        renderer: SCNSceneRenderer
+    ) -> SCNGeometry? {
+        guard contour.pose != nil,
+              contour.outer.count == Self.lipPointCount,
+              contour.inner.count == Self.lipPointCount,
+              contour.outerUV.count == Self.lipPointCount,
+              contour.innerUV.count == Self.lipPointCount,
+              let device = renderer.device else {
+            return nil
+        }
+        let mesh = makeMediaPipeLipMesh(
+            contour: contour,
+            expandsOuterFeatherBoundary: true
+        )
+        guard mesh.vertices.count >= 4,
+              !mesh.indices.isEmpty else {
+            return nil
+        }
+
+        var geometryCache = screenSpaceGeometryCache
+        if geometryCache?.deviceRegistryID != device.registryID {
+            geometryCache = DynamicSurfaceGeometryCache(
+                device: device,
+                vertices: mesh.vertices,
+                indices: mesh.indices,
+                materials: [lipMaterial, linerMaterial]
+            )
+            screenSpaceGeometryCache = geometryCache
+        }
+        guard let geometryCache,
+              geometryCache.landmarkIndices.count == mesh.vertices.count else {
+            return nil
+        }
+
+        var vertexByLandmark: [Int: MeshVertex] = [:]
+        vertexByLandmark.reserveCapacity(mesh.vertices.count)
+        for vertex in mesh.vertices {
+            guard vertexByLandmark.updateValue(vertex, forKey: vertex.index) == nil else {
+                return nil
+            }
+        }
+
+        var positions: [SIMD3<Float>] = []
+        positions.reserveCapacity(geometryCache.landmarkIndices.count)
+        var maximumReprojectionError: CGFloat = 0
+        for landmarkIndex in geometryCache.landmarkIndices {
+            guard let vertex = vertexByLandmark[landmarkIndex],
+                  vertex.screen.x.isFinite,
+                  vertex.screen.y.isFinite else {
+                return nil
+            }
+            let worldPoint = renderer.unprojectPoint(
+                SCNVector3(
+                    Float(vertex.screen.x),
+                    Float(vertex.screen.y),
+                    Self.screenSpaceDepth
+                )
+            )
+            guard worldPoint.x.isFinite,
+                  worldPoint.y.isFinite,
+                  worldPoint.z.isFinite else {
+                return nil
+            }
+            let projected = renderer.projectPoint(worldPoint)
+            let error = hypot(
+                CGFloat(projected.x) - vertex.screen.x,
+                CGFloat(projected.y) - vertex.screen.y
+            )
+            guard error.isFinite else {
+                return nil
+            }
+            maximumReprojectionError = max(maximumReprojectionError, error)
+            positions.append(SIMD3<Float>(worldPoint.x, worldPoint.y, worldPoint.z))
+        }
+        guard maximumReprojectionError <= 1.25 else {
+            LipDebugLog.throttled(
+                "lip_mesh_2d_reprojection",
+                interval: 0.4,
+                "lip_mesh hide reason=screen_space_2d_reprojection maxPx=\(Self.fmt(maximumReprojectionError))"
             )
             return nil
         }

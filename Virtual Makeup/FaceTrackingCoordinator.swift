@@ -48,6 +48,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private let textureStateLock = NSLock()
     private let meshStateLock = NSLock()
     private let rendererStateLock = NSLock()
+    private let landmarkDebugLock = NSLock()
 
     private var faceLandmarker: FaceLandmarker?
     private var cachedViewportSize: CGSize = .zero
@@ -119,7 +120,12 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
     private var pendingLipOpacity: Double?
     private var pendingLinerStyle: PendingLinerStyle?
     private var pendingBlushStyle: PendingBlushStyle?
+    private var selectedLipRenderingMode: LipMeshRenderingMode = .screenSpace2D
+    private var pendingLipRenderingMode: LipMeshRenderingMode?
     private var rendererClearIsPending = false
+    private weak var landmarkDebugOverlay: LandmarkDebugOverlayView?
+    private var landmarkDebugIsEnabled = false
+    private var landmarkDebugRevision = 0
 
     private static let outerLipIndices = CanonicalLipGeometry.outerLipIndices
     private static let innerLipIndices = CanonicalLipGeometry.innerLipIndices
@@ -193,22 +199,31 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         resetLipTrackingAsync()
         let configuration = ARFaceTrackingConfiguration()
         configuration.isLightEstimationEnabled = true
-        // preferredFramesPerSecond controls SceneKit, but AR face anchors are
-        // still paced by the selected camera format. Prefer the fastest
-        // supported TrueDepth format so rigid lip attachment is updated at the
-        // camera rate instead of being limited to the 30 FPS default.
+        // Keep SceneKit rendering at 60 FPS, but capture the TrueDepth stream
+        // at 30 FPS. Compared with the fastest camera mode, this usually gives
+        // the sensor more light per frame and lets us prefer a higher-resolution
+        // preview while ARKit still supplies render-time pose compensation.
         let supportedFormats = ARFaceTrackingConfiguration.supportedVideoFormats
-        if let fastestFrameRate = supportedFormats.map(\.framesPerSecond).max(),
-           let fastestFormat = supportedFormats
-            .filter({ $0.framesPerSecond == fastestFrameRate })
-            .max(by: {
+        let preferredFrameRate = 30
+        let preferredFormat = supportedFormats
+            .filter { $0.framesPerSecond == preferredFrameRate }
+            .max {
                 $0.imageResolution.width * $0.imageResolution.height <
                     $1.imageResolution.width * $1.imageResolution.height
-            }) {
-            configuration.videoFormat = fastestFormat
+            }
+        let fallbackFormat = supportedFormats.max {
+            let leftArea = $0.imageResolution.width * $0.imageResolution.height
+            let rightArea = $1.imageResolution.width * $1.imageResolution.height
+            if leftArea == rightArea {
+                return $0.framesPerSecond < $1.framesPerSecond
+            }
+            return leftArea < rightArea
+        }
+        if let selectedFormat = preferredFormat ?? fallbackFormat {
+            configuration.videoFormat = selectedFormat
             LipDebugLog.throttled(
                 "lip_camera_format",
-                "lip_camera fps=\(fastestFormat.framesPerSecond) resolution=\(Int(fastestFormat.imageResolution.width))x\(Int(fastestFormat.imageResolution.height))"
+                "lip_camera targetFPS=\(preferredFrameRate) selectedFPS=\(selectedFormat.framesPerSecond) resolution=\(Int(selectedFormat.imageResolution.width))x\(Int(selectedFormat.imageResolution.height))"
             )
         }
         sceneView?.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
@@ -220,6 +235,43 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         requestRendererClear()
         setTrackedFaceAnchor(nil, isTracked: false)
         DispatchQueue.main.async { self.isFaceDetected = false }
+    }
+
+    func configureLandmarkDebugOverlay(_ overlay: LandmarkDebugOverlayView?,
+                                       isEnabled: Bool) {
+        precondition(Thread.isMainThread)
+        landmarkDebugOverlay = overlay
+        updateLandmarkDebug(isEnabled: isEnabled)
+    }
+
+    func updateLandmarkDebug(isEnabled: Bool) {
+        precondition(Thread.isMainThread)
+        landmarkDebugLock.lock()
+        let didChange = landmarkDebugIsEnabled != isEnabled
+        landmarkDebugIsEnabled = isEnabled
+        if didChange {
+            landmarkDebugRevision &+= 1
+        }
+        landmarkDebugLock.unlock()
+
+        if !isEnabled {
+            landmarkDebugOverlay?.clear()
+        }
+    }
+
+    func updateLipRenderingMode(_ mode: LipMeshRenderingMode) {
+        rendererStateLock.lock()
+        let didChange = selectedLipRenderingMode != mode
+        selectedLipRenderingMode = mode
+        if didChange {
+            pendingLipRenderingMode = mode
+            rendererClearIsPending = true
+        }
+        rendererStateLock.unlock()
+
+        if didChange {
+            resetLipTrackingAsync()
+        }
     }
 
     func updateLipstick(color: LipstickColor,
@@ -355,21 +407,39 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
                 renderMotionSample: renderMotionSample,
                 faceGeometry: faceAnchor.geometry,
                 renderer: renderer,
-                faceNode: node
+                faceNode: node,
+                renderingMode: lipMeshRenderer.renderingMode
             )
-            if let mouthFrame,
-               let meshState {
-                lipMeshRenderer.render(
-                    contour: meshState.contour,
-                    texture: meshState.texture,
-                    faceGeometry: faceAnchor.geometry,
-                    mouthFrame: mouthFrame,
-                    renderer: renderer,
-                    faceNode: node,
-                    contourAge: meshState.contourAge,
-                    motionDelta: meshState.motionDelta,
-                    freshnessVisibility: meshState.freshnessVisibility
-                )
+            if let meshState {
+                publishRenderedLandmarkDebug(contour: meshState.contour)
+                switch lipMeshRenderer.renderingMode {
+                case .faceSurface:
+                    if let mouthFrame {
+                        lipMeshRenderer.render(
+                            contour: meshState.contour,
+                            texture: meshState.texture,
+                            faceGeometry: faceAnchor.geometry,
+                            mouthFrame: mouthFrame,
+                            renderer: renderer,
+                            faceNode: node,
+                            contourAge: meshState.contourAge,
+                            motionDelta: meshState.motionDelta,
+                            freshnessVisibility: meshState.freshnessVisibility
+                        )
+                    } else {
+                        lipMeshRenderer.renderUnavailable()
+                    }
+                case .screenSpace2D:
+                    lipMeshRenderer.renderScreenLocked(
+                        contour: meshState.contour,
+                        texture: meshState.texture,
+                        renderer: renderer,
+                        sceneRoot: sceneView?.scene.rootNode,
+                        contourAge: meshState.contourAge,
+                        motionDelta: meshState.motionDelta,
+                        freshnessVisibility: meshState.freshnessVisibility
+                    )
+                }
             } else {
                 let availability = currentLipMeshAvailability()
                 LipDebugLog.throttled(
@@ -467,14 +537,19 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             for: viewport.orientation,
             viewportSize: viewportSize
         )
-        let faceSurfaceProjectionInput = FaceSurfaceProjectionInput(
-            geometry: faceAnchor.geometry,
-            anchorTransform: faceAnchor.transform,
-            camera: frame.camera,
-            orientation: viewport.orientation,
-            viewportSize: viewportSize,
-            anchorIdentifier: faceAnchor.identifier
-        )
+        let faceSurfaceProjectionInput: FaceSurfaceProjectionInput?
+        if currentLipRenderingMode() == .faceSurface {
+            faceSurfaceProjectionInput = FaceSurfaceProjectionInput(
+                geometry: faceAnchor.geometry,
+                anchorTransform: faceAnchor.transform,
+                camera: frame.camera,
+                orientation: viewport.orientation,
+                viewportSize: viewportSize,
+                anchorIdentifier: faceAnchor.identifier
+            )
+        } else {
+            faceSurfaceProjectionInput = nil
+        }
         let trackingEpoch = currentLandmarkTrackingEpoch()
         let context = FrameContext(
             pixelBuffer: frame.capturedImage,
@@ -611,7 +686,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let renderScale: CGFloat
         let interfaceOrientation: UIInterfaceOrientation
         let capturedImageToViewportTransform: CGAffineTransform
-        let faceSurfaceProjectionInput: FaceSurfaceProjectionInput
+        let faceSurfaceProjectionInput: FaceSurfaceProjectionInput?
         let viewportRevision: Int
         let trackingEpoch: Int
         let anchorIdentifier: UUID
@@ -651,7 +726,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let submittedAt: CFTimeInterval
         let inputToCapturedImageTransform: CGAffineTransform
         let capturedImageToViewportTransform: CGAffineTransform
-        let faceSurfaceSnapshot: FaceSurfaceSnapshot
+        let faceSurfaceSnapshot: FaceSurfaceSnapshot?
         let viewportRevision: Int
         let trackingEpoch: Int
         let anchorIdentifier: UUID
@@ -824,26 +899,34 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }
 
         let surfaceProjectionStartedAt = CACurrentMediaTime()
-        let preferredSurfaceTriangles = preferredFaceSurfaceTriangleKeys(
-            for: context.faceSurfaceProjectionInput
-        )
-        guard let faceSurfaceSnapshot = makeFaceSurfaceSnapshot(
-            from: context.faceSurfaceProjectionInput,
-            preferredTriangleKeys: preferredSurfaceTriangles
-        ) else {
-            faceSurfaceTopologyCache = nil
-            shouldExpandFaceSurfaceTopology = true
-            LipDebugLog.throttled(
-                "lip_surface_snapshot_reject",
-                interval: 0.6,
-                "lip_surface reject stage=snapshot timestamp=\(context.timestampInMilliseconds)"
+        let faceSurfaceSnapshot: FaceSurfaceSnapshot?
+        let preferredSurfaceTriangles: Set<FaceSurfaceTriangleKey>?
+        if let faceSurfaceProjectionInput = context.faceSurfaceProjectionInput {
+            preferredSurfaceTriangles = preferredFaceSurfaceTriangleKeys(
+                for: faceSurfaceProjectionInput
             )
-            handleMissedLipDetection()
-            completeLandmarkDetection(
-                timestampInMilliseconds: context.timestampInMilliseconds,
-                trackingEpoch: context.trackingEpoch
-            )
-            return
+            guard let snapshot = makeFaceSurfaceSnapshot(
+                from: faceSurfaceProjectionInput,
+                preferredTriangleKeys: preferredSurfaceTriangles
+            ) else {
+                faceSurfaceTopologyCache = nil
+                shouldExpandFaceSurfaceTopology = true
+                LipDebugLog.throttled(
+                    "lip_surface_snapshot_reject",
+                    interval: 0.6,
+                    "lip_surface reject stage=snapshot timestamp=\(context.timestampInMilliseconds)"
+                )
+                handleMissedLipDetection()
+                completeLandmarkDetection(
+                    timestampInMilliseconds: context.timestampInMilliseconds,
+                    trackingEpoch: context.trackingEpoch
+                )
+                return
+            }
+            faceSurfaceSnapshot = snapshot
+        } else {
+            preferredSurfaceTriangles = nil
+            faceSurfaceSnapshot = nil
         }
 
         let surfaceProjectionFinishedAt = CACurrentMediaTime()
@@ -923,7 +1006,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         LipDebugLog.throttled(
             "lip_sync_submit",
             interval: 0.6,
-            "lip_sync submit timestamp=\(context.timestampInMilliseconds) captureToReceiptMs=\(String(format: "%.1f", (context.receivedAt - context.frameTimestamp) * 1000)) captureToSubmitMs=\(String(format: "%.1f", (submittedAt - context.frameTimestamp) * 1000)) preprocessMs=\(String(format: "%.1f", preprocessingMilliseconds)) surfaceMs=\(String(format: "%.1f", surfaceProjectionMilliseconds)) input=\(Int(imageSize.width))x\(Int(imageSize.height)) surfaceTriangles=\(faceSurfaceSnapshot.triangles.count) indexed=\(preferredSurfaceTriangles != nil) epoch=\(context.trackingEpoch) viewport=\(context.viewportRevision)"
+            "lip_sync submit timestamp=\(context.timestampInMilliseconds) captureToReceiptMs=\(String(format: "%.1f", (context.receivedAt - context.frameTimestamp) * 1000)) captureToSubmitMs=\(String(format: "%.1f", (submittedAt - context.frameTimestamp) * 1000)) preprocessMs=\(String(format: "%.1f", preprocessingMilliseconds)) surfaceMs=\(String(format: "%.1f", surfaceProjectionMilliseconds)) input=\(Int(imageSize.width))x\(Int(imageSize.height)) surfaceTriangles=\(faceSurfaceSnapshot?.triangles.count ?? 0) indexed=\(preferredSurfaceTriangles != nil) epoch=\(context.trackingEpoch) viewport=\(context.viewportRevision)"
         )
         scheduleLandmarkCallbackWatchdog(
             timestampInMilliseconds: context.timestampInMilliseconds,
@@ -1071,6 +1154,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             handleMissedLipDetection()
             return
         }
+        publishLandmarkDebug(landmarks: landmarks, frame: frame)
         guard isUsableFaceTransform(result.facialTransformationMatrixes.first) else {
             LipDebugLog.throttled(
                 "lip_detection_bad_transform",
@@ -1122,9 +1206,16 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         )
         let smoothedContour: LipContour
         if lowLatencyShapeChange {
+            let debugParameters = rawContourDebugParameters(
+                for: detection.contour,
+                motionReference: frame.motionReference
+            )
             contourStabilityConfidence = 0
             contourIsStationary = false
             smoothedContour = detection.contour
+            if let debugParameters {
+                publishLandmarkDebugMetrics(debugParameters)
+            }
         } else {
             smoothedContour = adaptivelySmoothed(
                 detection.contour,
@@ -1136,13 +1227,14 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             createdAt: CFTimeInterval,
             age: CFTimeInterval
         )? = {
-            guard let previous = smoothedLipContour,
+            guard let faceSurfaceSnapshot = frame.faceSurfaceSnapshot,
+                  let previous = smoothedLipContour,
                   hasCompleteSurfaceCarrier(previous),
-                  previous.surfaceVertexCount == frame.faceSurfaceSnapshot.vertexCount,
+                  previous.surfaceVertexCount == faceSurfaceSnapshot.vertexCount,
                   previous.surfaceTriangleIndexCount ==
-                    frame.faceSurfaceSnapshot.triangleIndexCount,
+                    faceSurfaceSnapshot.triangleIndexCount,
                   previous.surfaceTopologySignature ==
-                    frame.faceSurfaceSnapshot.topologySignature,
+                    faceSurfaceSnapshot.topologySignature,
                   let createdAt = previous.surfaceCarrierCreatedAt else {
                 return nil
             }
@@ -1162,11 +1254,17 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }()
 
         var stableContour: LipContour
-        if let heldSurfaceCarrier,
+        if currentLipRenderingMode() == .screenSpace2D {
+            // The 2D baseline consumes MediaPipe X/Y directly and therefore has
+            // no reason to delay publication while AR face-surface bindings are
+            // acquired or refreshed.
+            stableContour = smoothedContour
+        } else if let faceSurfaceSnapshot = frame.faceSurfaceSnapshot,
+                  let heldSurfaceCarrier,
            let refreshedBindings = refreshedDepthBindings(
                from: heldSurfaceCarrier.contour,
                for: detection.contour,
-               snapshot: frame.faceSurfaceSnapshot
+               snapshot: faceSurfaceSnapshot
            ) {
             // Keep the same stable AR triangles whenever their current
             // reprojection remains valid. The indexed lookup makes this O(80)
@@ -1210,10 +1308,11 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
                 interval: 0.4,
                 "lip_surface publish=fresh_mediapipe carrier=held_depth rebind=deferred carrierAgeMs=\(String(format: "%.1f", heldSurfaceCarrier.age * 1000)) timestamp=\(timestampInMilliseconds)"
             )
-        } else if let currentDepthContour = contourBoundToFaceSurface(
+        } else if let faceSurfaceSnapshot = frame.faceSurfaceSnapshot,
+                  let currentDepthContour = contourBoundToFaceSurface(
             detection.contour,
             publishing: smoothedContour,
-            snapshot: frame.faceSurfaceSnapshot,
+            snapshot: faceSurfaceSnapshot,
             carrierCreatedAt: frame.frameTimestamp
         ) {
             // Initial acquisition and bounded carrier expiry are the only
@@ -2882,7 +2981,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         let currentGeneration = currentTextureGeneration()
         let latestRequestID = currentLatestTextureRequestID()
         let generationOK = currentGeneration == request.generation
-        let isSuperseded = latestRequestID != request.requestID
+        let hasNewerRequestPending = latestRequestID != request.requestID
         let now = CACurrentMediaTime()
         let renderRequestAge = now - request.createdAt
         let sourceAge = now - request.sourceCaptureTime
@@ -2907,7 +3006,6 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
            hasFreshShape,
            availability.contour,
            generationOK,
-           !isSuperseded,
            temporalContextIsCurrent,
            requestStillFresh,
            requestStillAligned,
@@ -2925,7 +3023,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             LipDebugLog.throttled(
                 "lip_texture_reject",
                 interval: 0.6,
-                "lip_texture reject stableUV=true hasTexture=\(texture != nil) tracked=\(isTracked) freshShape=\(hasFreshShape) hasContour=\(availability.contour) generationOK=\(generationOK) temporalContextOK=\(temporalContextIsCurrent) superseded=\(isSuperseded) freshRequestDiagnostic=\(requestStillFresh) alignedDiagnostic=\(requestStillAligned) sourceAge=\(String(format: "%.2f", sourceAge)) renderAge=\(String(format: "%.2f", renderRequestAge)) motion=\(String(format: "%.2f", requestMotionDelta)) requestID=\(request.requestID) latestRequestID=\(latestRequestID) requestGeneration=\(request.generation) currentGeneration=\(currentGeneration)"
+                "lip_texture reject stableUV=true hasTexture=\(texture != nil) tracked=\(isTracked) freshShape=\(hasFreshShape) hasContour=\(availability.contour) generationOK=\(generationOK) temporalContextOK=\(temporalContextIsCurrent) newerPending=\(hasNewerRequestPending) freshRequestDiagnostic=\(requestStillFresh) alignedDiagnostic=\(requestStillAligned) sourceAge=\(String(format: "%.2f", sourceAge)) renderAge=\(String(format: "%.2f", renderRequestAge)) motion=\(String(format: "%.2f", requestMotionDelta)) requestID=\(request.requestID) latestRequestID=\(latestRequestID) requestGeneration=\(request.generation) currentGeneration=\(currentGeneration)"
             )
         }
 
@@ -3116,6 +3214,152 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         return pointsByIndex
     }
 
+    private func publishLandmarkDebug(landmarks: [NormalizedLandmark],
+                                      frame: PendingLiveFrame) {
+        landmarkDebugLock.lock()
+        let isEnabled = landmarkDebugIsEnabled
+        let revision = landmarkDebugRevision
+        landmarkDebugLock.unlock()
+        guard isEnabled else {
+            return
+        }
+
+        let lipIndices = Set(Self.attentionLipIndices)
+        var facePoints: [CGPoint] = []
+        var lipPoints: [CGPoint] = []
+        facePoints.reserveCapacity(max(landmarks.count - lipIndices.count, 0))
+        lipPoints.reserveCapacity(lipIndices.count)
+        let extendedViewport = CGRect(
+            x: -frame.viewportSize.width * 0.10,
+            y: -frame.viewportSize.height * 0.10,
+            width: frame.viewportSize.width * 1.20,
+            height: frame.viewportSize.height * 1.20
+        )
+
+        for (index, landmark) in landmarks.enumerated() {
+            guard landmark.x.isFinite, landmark.y.isFinite else {
+                continue
+            }
+            let viewportNormalizedPoint = CGPoint(
+                x: CGFloat(landmark.x),
+                y: CGFloat(landmark.y)
+            )
+            .applying(frame.inputToCapturedImageTransform)
+            .applying(frame.capturedImageToViewportTransform)
+            let point = CGPoint(
+                x: viewportNormalizedPoint.x * frame.viewportSize.width,
+                y: viewportNormalizedPoint.y * frame.viewportSize.height
+            )
+            guard point.x.isFinite,
+                  point.y.isFinite,
+                  extendedViewport.contains(point) else {
+                continue
+            }
+
+            if lipIndices.contains(index) {
+                lipPoints.append(point)
+            } else {
+                facePoints.append(point)
+            }
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.landmarkDebugLock.lock()
+            let isCurrent = self.landmarkDebugIsEnabled &&
+                self.landmarkDebugRevision == revision
+            self.landmarkDebugLock.unlock()
+            guard isCurrent else {
+                return
+            }
+            self.landmarkDebugOverlay?.updateRaw(
+                facePoints: facePoints,
+                lipPoints: lipPoints
+            )
+        }
+    }
+
+    private func publishRenderedLandmarkDebug(contour: LipContour) {
+        landmarkDebugLock.lock()
+        let isEnabled = landmarkDebugIsEnabled
+        let revision = landmarkDebugRevision
+        landmarkDebugLock.unlock()
+        guard isEnabled else {
+            return
+        }
+
+        let points = Self.attentionLipIndices.compactMap { index -> CGPoint? in
+            guard let point = contour.meshPointsByIndex[index]?.screen,
+                  point.x.isFinite,
+                  point.y.isFinite else {
+                return nil
+            }
+            return point
+        }
+        guard points.count == Self.attentionLipIndices.count else {
+            return
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.landmarkDebugLock.lock()
+            let isCurrent = self.landmarkDebugIsEnabled &&
+                self.landmarkDebugRevision == revision
+            self.landmarkDebugLock.unlock()
+            guard isCurrent else {
+                return
+            }
+            self.landmarkDebugOverlay?.updateRenderedLipPoints(points)
+        }
+    }
+
+    private func publishLandmarkDebugMetrics(
+        _ parameters: ContourSmoothingParameters
+    ) {
+        landmarkDebugLock.lock()
+        let isEnabled = landmarkDebugIsEnabled
+        let revision = landmarkDebugRevision
+        landmarkDebugLock.unlock()
+        guard isEnabled else {
+            return
+        }
+
+        let metrics = LandmarkDebugMetrics(
+            activity: parameters.activity,
+            stability: parameters.stability,
+            alpha: parameters.alpha,
+            deadZone: parameters.deadZone,
+            median: parameters.medianResidual,
+            p95: parameters.p95Residual
+        )
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.landmarkDebugLock.lock()
+            let isCurrent = self.landmarkDebugIsEnabled &&
+                self.landmarkDebugRevision == revision
+            self.landmarkDebugLock.unlock()
+            guard isCurrent else {
+                return
+            }
+            self.landmarkDebugOverlay?.updateMetrics(metrics)
+        }
+    }
+
+    private func clearLandmarkDebugOverlay() {
+        landmarkDebugLock.lock()
+        landmarkDebugRevision &+= 1
+        landmarkDebugLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.landmarkDebugOverlay?.clear()
+        }
+    }
+
 
     private func adaptivelySmoothed(
         _ contour: LipContour,
@@ -3163,6 +3407,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             for: contour,
             alignedPrevious: previous
         )
+        publishLandmarkDebugMetrics(parameters)
         let alpha = parameters.alpha
         let outer = zip(previous.outer, contour.outer).map {
             smooth(
@@ -3225,6 +3470,57 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             meshPointsByIndex: meshPoints,
             faceGeometryPose: contour.faceGeometryPose ?? previous.faceGeometryPose,
             isStationary: parameters.isStationary
+        )
+    }
+
+    private func rawContourDebugParameters(
+        for contour: LipContour,
+        motionReference: LipMotionPose?
+    ) -> ContourSmoothingParameters? {
+        landmarkDebugLock.lock()
+        let isEnabled = landmarkDebugIsEnabled
+        landmarkDebugLock.unlock()
+        guard isEnabled,
+              var previous = smoothedLipContour,
+              previous.outer.count == contour.outer.count,
+              previous.inner.count == contour.inner.count else {
+            return nil
+        }
+
+        if let sourceMotionPose = lastAcceptedMotionPose,
+           let targetMotionPose = motionReference {
+            previous = previous.transformed(
+                from: LipPose(
+                    center: sourceMotionPose.center,
+                    width: sourceMotionPose.width,
+                    angle: sourceMotionPose.angle
+                ),
+                to: LipPose(
+                    center: targetMotionPose.center,
+                    width: targetMotionPose.width,
+                    angle: targetMotionPose.angle
+                )
+            )
+        } else if let sourcePose = smoothedLipPose,
+                  let targetPose = contour.pose {
+            previous = previous.transformed(
+                from: sourcePose,
+                to: targetPose
+            )
+        }
+
+        let measured = smoothingParameters(
+            for: contour,
+            alignedPrevious: previous
+        )
+        return ContourSmoothingParameters(
+            alpha: 1,
+            deadZone: 0,
+            isStationary: false,
+            stability: 0,
+            activity: measured.activity,
+            medianResidual: measured.medianResidual,
+            p95Residual: measured.p95Residual
         )
     }
 
@@ -3381,15 +3677,16 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
             contourIsStationary = true
         }
 
-        // Alpha now changes continuously. Even before the idle hysteresis has
-        // engaged, a quiet residual never falls back to the old near-raw 0.99.
+        // Keep idle samples strongly stabilized, but let coherent active
+        // motion approach the current MediaPipe keyframe. Capping active
+        // samples at 0.68 added almost one detector frame of visible mask lag.
         let alpha = min(
             max(
-                0.18 + activity * 0.43 +
-                    (1 - contourStabilityConfidence) * 0.07,
+                0.18 + activity * 0.70 +
+                    (1 - contourStabilityConfidence) * 0.08,
                 0.18
             ),
-            0.68
+            0.96
         )
         let maximumDeadZone = min(
             max(currentPose.width * 0.0036, 0.26),
@@ -4649,7 +4946,6 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
 
         textureStateLock.lock()
         guard textureGeneration == request.generation,
-              request.requestID == latestTextureRequestID,
               request.requestID > latestInstalledTextureRequestID,
               currentTrackingEpoch == request.trackingEpoch,
               currentAnchorIdentifier == request.anchorIdentifier,
@@ -4676,7 +4972,8 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         renderMotionSample: LipMotionSample?,
         faceGeometry: ARFaceGeometry,
         renderer: SCNSceneRenderer,
-        faceNode: SCNNode
+        faceNode: SCNNode,
+        renderingMode: LipMeshRenderingMode
     ) -> LipMeshState? {
         meshStateLock.lock()
         let contour = latestMeshContour
@@ -4747,7 +5044,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }
 
         let motionDelta = motionDelta(from: contourMotionPose, to: currentMotionPose)
-        guard hasCompleteSurfaceCarrier(contour) else {
+        guard renderingMode != .faceSurface || hasCompleteSurfaceCarrier(contour) else {
             LipDebugLog.throttled(
                 "lip_mesh_real_contour_no_depth",
                 interval: 0.4,
@@ -4799,40 +5096,84 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         }
 
         let temporallyCompensatedContour: LipContour
-        let arExpressionDelta = expressionMotionDelta(
-            from: contourMotionPose,
-            to: currentMotionPose
-        )
-        if contour.isStationary && arExpressionDelta < 0.006 {
-            // At rest ARKit's per-vertex face mesh and MediaPipe's short-term
-            // velocity are both noisier than the real lip motion. Keep only
-            // the rigid head pose until either detector hysteresis or a real
-            // ARKit mouth-expression delta exits idle mode.
+        if renderingMode == .screenSpace2D {
+            // Accepted hybrid contract: the current ARKit face pose owns only
+            // global translation/scale/rotation. MediaPipe remains the sole
+            // owner of local lip shape until the next accepted observation.
+            // Do not layer ARKit mouth deformation or a second predictor on
+            // top; switching among those paths creates different trajectories
+            // for the same contour and visible catch-up corrections.
             temporallyCompensatedContour = displayedContour
-        } else if arExpressionDelta >= 0.006 {
-            // MediaPipe is the shape keyframe, but it is normally 80-150 ms
-            // old by the time it reaches this render callback. ARKit's current
-            // blendshapes therefore own active mouth motion. Previously a
-            // formally valid but nearly static surface warp won this branch
-            // first and left the visible contour one detector frame behind.
-            let arExpressionContour = arExpressionCompensatedContour(
-                capturedContour: contour,
-                rigidReferenceContour: displayedContour,
-                sourceMotionPose: contourMotionPose,
-                targetMotionPose: currentMotionPose,
-                viewportSize: activeViewport.size
+            LipDebugLog.throttled(
+                "lip_temporal_screen_hybrid",
+                interval: 0.75,
+                "lip_temporal route=screen_hybrid global=arkit local=mediapipe age=\(String(format: "%.3f", contourAge))"
             )
-            if let arExpressionContour {
-                temporallyCompensatedContour = arExpressionContour
-                LipDebugLog.throttled(
-                    "lip_temporal_arkit_expression",
-                    interval: 0.75,
-                    "lip_temporal route=arkit_expression delta=\(String(format: "%.3f", arExpressionDelta)) age=\(String(format: "%.3f", contourAge))"
+        } else {
+            let arExpressionDelta = expressionMotionDelta(
+                from: contourMotionPose,
+                to: currentMotionPose
+            )
+            if contour.isStationary && arExpressionDelta < 0.006 {
+                // At rest ARKit's per-vertex face mesh and MediaPipe's short-term
+                // velocity are both noisier than the real lip motion. Keep only
+                // the rigid head pose until either detector hysteresis or a real
+                // ARKit mouth-expression delta exits idle mode.
+                temporallyCompensatedContour = displayedContour
+            } else if arExpressionDelta >= 0.006 {
+                // MediaPipe is the shape keyframe, but it is normally 80-150 ms
+                // old by the time it reaches this render callback. ARKit's current
+                // blendshapes therefore own active mouth motion. Previously a
+                // formally valid but nearly static surface warp won this branch
+                // first and left the visible contour one detector frame behind.
+                let arExpressionContour = arExpressionCompensatedContour(
+                    capturedContour: contour,
+                    rigidReferenceContour: displayedContour,
+                    sourceMotionPose: contourMotionPose,
+                    targetMotionPose: currentMotionPose,
+                    viewportSize: activeViewport.size
                 )
+                if let arExpressionContour {
+                    temporallyCompensatedContour = arExpressionContour
+                    LipDebugLog.throttled(
+                        "lip_temporal_arkit_expression",
+                        interval: 0.75,
+                        "lip_temporal route=arkit_expression delta=\(String(format: "%.3f", arExpressionDelta)) age=\(String(format: "%.3f", contourAge))"
+                    )
+                } else {
+                    // Do not route a rejected active expression through the
+                    // generic surface carrier: that is the exact high-motion case
+                    // in which device logs show its bindings becoming outliers.
+                    temporallyCompensatedContour = expressionPredictedContour(
+                        baseContour: displayedContour,
+                        previousSample: previousRealSample,
+                        latestSample: latestRealSample,
+                        targetMotionPose: currentMotionPose,
+                        targetFrameTimestamp: currentMotionSample?.frameTimestamp,
+                        viewportSize: activeViewport.size
+                    )
+                    LipDebugLog.throttled(
+                        "lip_temporal_prediction_fallback",
+                        interval: 0.75,
+                        "lip_temporal route=prediction reason=arkit_topology delta=\(String(format: "%.3f", arExpressionDelta)) age=\(String(format: "%.3f", contourAge))"
+                    )
+                }
+            } else if let surfaceWarpedContour = surfaceDeformedContour(
+                from: contour,
+                rigidReferenceContour: displayedContour,
+                faceGeometry: faceGeometry,
+                renderer: renderer,
+                faceNode: faceNode,
+                viewportSize: activeViewport.size
+            ) {
+                // The surface carrier is useful only as a quiet, local residual.
+                // Large expression motion is handled by the branch above.
+                temporallyCompensatedContour = surfaceWarpedContour
             } else {
-                // Do not route a rejected active expression through the
-                // generic surface carrier: that is the exact high-motion case
-                // in which device logs show its bindings becoming outliers.
+                // ARKit sees no meaningful global expression and the surface
+                // residual was not trustworthy. Use only a short, bounded
+                // MediaPipe velocity correction; the real contour remains the
+                // source of shape and topology.
                 temporallyCompensatedContour = expressionPredictedContour(
                     baseContour: displayedContour,
                     previousSample: previousRealSample,
@@ -4841,41 +5182,10 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
                     targetFrameTimestamp: currentMotionSample?.frameTimestamp,
                     viewportSize: activeViewport.size
                 )
-                LipDebugLog.throttled(
-                    "lip_temporal_prediction_fallback",
-                    interval: 0.75,
-                    "lip_temporal route=prediction reason=arkit_topology delta=\(String(format: "%.3f", arExpressionDelta)) age=\(String(format: "%.3f", contourAge))"
-                )
             }
-        } else if let surfaceWarpedContour = surfaceDeformedContour(
-            from: contour,
-            rigidReferenceContour: displayedContour,
-            faceGeometry: faceGeometry,
-            renderer: renderer,
-            faceNode: faceNode,
-            viewportSize: activeViewport.size
-        ) {
-            // The surface carrier is useful only as a quiet, local residual.
-            // Large expression motion is handled by the branch above.
-            temporallyCompensatedContour = surfaceWarpedContour
-        } else {
-            // ARKit sees no meaningful global expression and the surface
-            // residual was not trustworthy. Use only a short, bounded
-            // MediaPipe velocity correction; the real contour remains the
-            // source of shape and topology.
-            temporallyCompensatedContour = expressionPredictedContour(
-                baseContour: displayedContour,
-                previousSample: previousRealSample,
-                latestSample: latestRealSample,
-                targetMotionPose: currentMotionPose,
-                targetFrameTimestamp: currentMotionSample?.frameTimestamp,
-                viewportSize: activeViewport.size
-            )
         }
 
         return LipMeshState(
-            // Apply one uniform pose transform to the whole detected contour.
-            // Expression prediction below is bounded and topology-checked.
             contour: softenedCupidsBow(in: temporallyCompensatedContour),
             texture: texture,
             contourAge: contourAge,
@@ -5644,6 +5954,7 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
 
     private func resetLipTracking(invalidatePipeline: Bool = true,
                                   invalidateTextures: Bool = true) {
+        clearLandmarkDebugOverlay()
         let resetEpoch = invalidatePipeline ? invalidateLandmarkPipeline() : nil
         let motionCutoffEpoch = resetEpoch ?? currentLandmarkTrackingEpoch()
         if invalidateTextures {
@@ -5692,21 +6003,33 @@ final class Coordinator: NSObject, ARSCNViewDelegate, ARSessionDelegate, FaceLan
         rendererStateLock.unlock()
     }
 
+    private func currentLipRenderingMode() -> LipMeshRenderingMode {
+        rendererStateLock.lock()
+        let mode = selectedLipRenderingMode
+        rendererStateLock.unlock()
+        return mode
+    }
+
     private func applyPendingRendererState() {
         rendererStateLock.lock()
         let lipOpacity = pendingLipOpacity
         let linerStyle = pendingLinerStyle
         let blushStyle = pendingBlushStyle
+        let lipRenderingMode = pendingLipRenderingMode
         let shouldClear = rendererClearIsPending
         pendingLipOpacity = nil
         pendingLinerStyle = nil
         pendingBlushStyle = nil
+        pendingLipRenderingMode = nil
         rendererClearIsPending = false
         rendererStateLock.unlock()
 
         if shouldClear {
             lipMeshRenderer.clearAll()
             blushRenderer.clear()
+        }
+        if let lipRenderingMode {
+            lipMeshRenderer.updateRenderingMode(lipRenderingMode)
         }
         if let lipOpacity {
             lipMeshRenderer.updateOpacity(lipOpacity)
