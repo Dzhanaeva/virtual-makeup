@@ -77,9 +77,12 @@ final class MetalLipColorCompositor {
         var innerPointCount: UInt32
         var outerFeatherPixels: Float
         var outerInnerFeatherPixels: Float
-        var apertureFeatherPixels: Float
-        var apertureMouthFeatherPixels: Float
-        var apertureInsetPixels: Float
+        var innerMouthSolidPixels: Float
+        var innerMouthTransitionPixels: Float
+        var recessLipPixels: Float
+        var recessLipFraction: Float
+        var openRecessDarkening: Float
+        var closedRecessDarkening: Float
         var apertureClosure: Float
         var finish: Float
     }
@@ -204,9 +207,12 @@ final class MetalLipColorCompositor {
         uint innerPointCount;
         float outerFeatherPixels;
         float outerInnerFeatherPixels;
-        float apertureFeatherPixels;
-        float apertureMouthFeatherPixels;
-        float apertureInsetPixels;
+        float innerMouthSolidPixels;
+        float innerMouthTransitionPixels;
+        float recessLipPixels;
+        float recessLipFraction;
+        float openRecessDarkening;
+        float closedRecessDarkening;
         float apertureClosure;
         float finish;
     };
@@ -558,14 +564,13 @@ final class MetalLipColorCompositor {
                 (1.0 - toothGuard * 0.96);
         }
 
-        // Density is the only diffuse blending difference between products.
-        // The camera already owns the light and shadow in cameraAwarePigment;
-        // applying corner fades or inverse-alpha correction here would expose
-        // bright seams and flatten that captured value field.
+        // Preserve captured light and shadow as pigment thins near the wet
+        // line. The inner carrier includes camera samples from the aperture,
+        // so exclude bright, neutral tooth pixels from pigment as well as shine.
         LipFragmentOutput output;
         output.material = float4(
             cameraAwarePigment,
-            uniforms.coreCoverage
+            uniforms.coreCoverage * (1.0 - toothGuard * 0.98)
         );
         output.shine = currentShine;
         return output;
@@ -797,6 +802,43 @@ final class MetalLipColorCompositor {
         outputTexture.write(float4(inputShine * geometryGate), position);
     }
 
+    float lip_inner_coverage(
+        float signedDistance,
+        LipFeatherUniforms uniforms
+    ) {
+        float openCoverage = 1.0 - smoothstep(
+            uniforms.innerMouthSolidPixels,
+            uniforms.innerMouthSolidPixels + uniforms.innerMouthTransitionPixels,
+            signedDistance
+        );
+        float opening = 1.0 - saturate(uniforms.apertureClosure);
+        float openAmount = smoothstep(0.05, 0.25, opening);
+        // The closed inner polygon is fully covered; the fold is colour only.
+        return mix(1.0, openCoverage, openAmount);
+    }
+
+    float lip_inner_recess_shade(
+        float signedDistance,
+        float lipThickness,
+        LipFeatherUniforms uniforms
+    ) {
+        float lipRamp = min(
+            uniforms.recessLipPixels,
+            max(lipThickness * uniforms.recessLipFraction, 0.001)
+        );
+        float depth = smoothstep(
+            -lipRamp,
+            uniforms.innerMouthSolidPixels,
+            signedDistance
+        );
+        float darkening = mix(
+            uniforms.openRecessDarkening,
+            uniforms.closedRecessDarkening,
+            saturate(uniforms.apertureClosure)
+        );
+        return 1.0 - darkening * depth;
+    }
+
     kernel void lip_composite(
         texture2d<float, access::read> colorTexture [[texture(0)]],
         texture2d<float, access::write> outputTexture [[texture(1)]],
@@ -906,29 +948,11 @@ final class MetalLipColorCompositor {
             innerPrevious = index;
         }
 
-        // The lip side of the inner contour must remain fully opaque. The old
-        // symmetric smoothstep put its low-alpha midpoint directly on this
-        // boundary, so texture filtering stretched it into a pale horizontal
-        // seam under head pitch. Put the entire transition inside the real
-        // aperture instead. A narrow aperture receives enough solid inward
-        // coverage for both sides to meet; as it opens, the solid reach shrinks
-        // and leaves a clean transparent centre for teeth and the mouth.
-        float apertureFeather = 1.0;
-        if (isInsideAperture) {
-            float solidInnerCoveragePixels = max(
-                uniforms.apertureFeatherPixels,
-                0.0
-            );
-            float innerTransitionPixels = max(
-                uniforms.apertureMouthFeatherPixels,
-                0.001
-            );
-            apertureFeather = 1.0 - smoothstep(
-                solidInnerCoveragePixels,
-                solidInnerCoveragePixels + innerTransitionPixels,
-                innerMinimumDistance
-            );
-        }
+        float signedInnerDistance = isInsideAperture ?
+            innerMinimumDistance : -innerMinimumDistance;
+        float apertureFeather = lip_inner_coverage(
+            signedInnerDistance, uniforms
+        );
 
         float maskCoverage = outerFeather * apertureFeather;
         if (uniforms.finish > 3.5) {
@@ -943,20 +967,12 @@ final class MetalLipColorCompositor {
             );
             maskCoverage *= tintDistribution;
         }
-        float recoverableInnerFeatherPixels =
-            max(uniforms.apertureFeatherPixels, 0.0) +
-            max(uniforms.apertureMouthFeatherPixels, 0.0);
-        bool canRecoverInsideApertureFeather =
-            isInsideAperture &&
-            innerMinimumDistance <= recoverableInnerFeatherPixels;
-        if (color.a <= 0.0 &&
-            maskCoverage > 0.001 &&
-            (!isInsideAperture || canRecoverInsideApertureFeather)) {
+        if (color.a <= 0.0 && maskCoverage > 0.001) {
             // The analytic feather can legitimately extend a few texels past
             // the triangulated colour pass. It can also expose a one-texel
             // raster hole when a very thin lip triangle becomes nearly
-            // degenerate. Inside the aperture, recovery is limited to the
-            // signed-distance feather above; the mask remains authoritative.
+            // degenerate. The signed-distance mask remains authoritative,
+            // including over the entire closed inner polygon.
             float4 recoveredColor = float4(0.0);
             int2 textureLimit = int2(
                 int(outputTexture.get_width()) - 1,
@@ -980,6 +996,11 @@ final class MetalLipColorCompositor {
             color = recoveredColor;
         }
         float alpha = color.a * maskCoverage;
+        color.rgb *= lip_inner_recess_shade(
+            signedInnerDistance,
+            minimumDistance + innerMinimumDistance,
+            uniforms
+        );
         float outerGateStart = max(outerFeatherDistance - 1.0, 0.0);
         float outerBlurGate = 1.0 - smoothstep(
             outerGateStart,
@@ -1571,35 +1592,28 @@ final class MetalLipColorCompositor {
                 )
             }
         }
-        let maskPixelScale = Float(pixelHeight) / 96.0
-        // Keep the detected inner lip edge in the opaque core. For a closed or
-        // very narrow aperture, inward coverage overlaps across the canonical
-        // hole and removes the seam. Once the mouth is visibly open, only a
-        // short solid rim plus a compact transition remains over the mucosa.
-        let apertureSolidInnerCoverage = Float(
-            LipInnerBoundaryLayout.solidCoveragePixels(
-                opening: smoothApertureOpening
-            )
-        ) * maskPixelScale
-        let apertureInnerTransition = Float(
-            LipInnerBoundaryLayout.transitionPixels(
-                opening: smoothApertureOpening
-            )
-        ) * maskPixelScale
+        let maskPixelScale = Float(pixelHeight) /
+            Float(LipInnerBoundaryLayout.referenceTextureHeight)
         var featherUniforms = FeatherUniforms(
             textureSize: SIMD2<Float>(Float(pixelWidth), Float(pixelHeight)),
             outerPointCount: UInt32(outerDistancePoints.count),
             innerPointCount: UInt32(innerDistancePoints.count),
-            // Keep the lip interior intact and generate only the translucent
-            // tail outside the detected boundary. The SceneKit carrier applies
-            // the stricter screen-space cap to that exterior feather.
             outerFeatherPixels:
                 LipOuterFeatherLayout.exteriorTransitionPixels * maskPixelScale,
             outerInnerFeatherPixels:
                 LipOuterFeatherLayout.interiorTransitionPixels * maskPixelScale,
-            apertureFeatherPixels: apertureSolidInnerCoverage,
-            apertureMouthFeatherPixels: apertureInnerTransition,
-            apertureInsetPixels: 0,
+            innerMouthSolidPixels:
+                Float(LipInnerBoundaryLayout.mouthSolidPixels) * maskPixelScale,
+            innerMouthTransitionPixels:
+                Float(LipInnerBoundaryLayout.mouthTransitionPixels) * maskPixelScale,
+            recessLipPixels:
+                Float(LipInnerBoundaryLayout.recessLipPixels) * maskPixelScale,
+            recessLipFraction:
+                Float(LipInnerBoundaryLayout.recessLipFraction),
+            openRecessDarkening:
+                Float(LipInnerBoundaryLayout.openRecessDarkening),
+            closedRecessDarkening:
+                Float(LipInnerBoundaryLayout.closedRecessDarkening),
             apertureClosure: apertureClosure,
             finish: Float(finish.rawValue)
         )

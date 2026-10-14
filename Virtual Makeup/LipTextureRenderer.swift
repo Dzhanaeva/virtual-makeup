@@ -29,6 +29,7 @@ final class LipTextureRenderer {
 
     private struct PixelMaterialInput {
         let alpha: Float
+        let recessShade: Float
         let lipBase: RGBColor
         let highlightSurround: RGBColor
         let pigment: RGBColor
@@ -84,12 +85,14 @@ final class LipTextureRenderer {
     private struct CanonicalLipSample {
         let point: CGPoint
         let alpha: Float
+        let recessShade: Float
         let outerDistance: CGFloat
         let innerDistance: CGFloat
     }
 
     private struct CanonicalAlphaSample {
         let alpha: Float
+        let recessShade: Float
         let outerDistance: CGFloat
         let innerDistance: CGFloat
     }
@@ -244,6 +247,7 @@ final class LipTextureRenderer {
             return CanonicalLipSample(
                 point: screen,
                 alpha: alphaSample.alpha,
+                recessShade: alphaSample.recessShade,
                 outerDistance: alphaSample.outerDistance,
                 innerDistance: alphaSample.innerDistance
             )
@@ -263,18 +267,24 @@ final class LipTextureRenderer {
                 edge1: featherWidth,
                 value: edgeDistances.outer
             ), 0.96)
-            // The lip side remains opaque. Inside the mouth, expose only the
-            // shared wet-line reach; the newly included fill triangles provide
-            // a real screen/camera sample for those pixels.
-            let innerCoverage = edgeDistances.isInsideAperture ?
-                self.innerCoverage(for: edgeDistances.inner) : 1
-            // Keep more of the transition translucent. This produces a soft
-            // cosmetic feather instead of a mathematically sharp silhouette.
+            let signedInnerDistance = edgeDistances.isInsideAperture ?
+                edgeDistances.inner : -edgeDistances.inner
+            let innerCoverage = excludesInnerMouth ? LipInnerBoundaryLayout.coverage(
+                signedDistance: signedInnerDistance,
+                opening: innerApertureVisibility
+            ) : 1
             guard innerCoverage > 0.001 else {
                 return nil
             }
             return CanonicalAlphaSample(
                 alpha: Float(outerCoverage * innerCoverage),
+                recessShade: excludesInnerMouth ? Float(
+                    LipInnerBoundaryLayout.recessShade(
+                        signedDistance: signedInnerDistance,
+                        lipThickness: edgeDistances.outer + edgeDistances.inner,
+                        opening: innerApertureVisibility
+                    )
+                ) : 1,
                 outerDistance: edgeDistances.outer,
                 innerDistance: edgeDistances.inner
             )
@@ -343,21 +353,11 @@ final class LipTextureRenderer {
             ) { current, segment in
                 min(current, Self.squaredDistance(from: uv, to: segment))
             }
-            let coverage = innerCoverage(for: sqrt(innerDistanceSquared))
-            return coverage > 0.001 ? coverage : nil
-        }
-
-        private func innerCoverage(for distance: CGFloat) -> CGFloat {
-            let opening = min(max(innerApertureVisibility, 0), 1)
-            let solidInnerWidth =
-                LipInnerBoundaryLayout.normalizedSolidCoverage(opening: opening)
-            let transitionWidth =
-                LipInnerBoundaryLayout.normalizedTransition(opening: opening)
-            return 1 - Self.smoothStep(
-                edge0: solidInnerWidth,
-                edge1: solidInnerWidth + transitionWidth,
-                value: distance
+            let coverage = LipInnerBoundaryLayout.coverage(
+                signedDistance: sqrt(innerDistanceSquared),
+                opening: innerApertureVisibility
             )
+            return coverage > 0.001 ? coverage : nil
         }
 
         private static func mix(_ first: CGPoint, _ second: CGPoint, t: CGFloat) -> CGPoint {
@@ -752,7 +752,18 @@ final class LipTextureRenderer {
                     pigmentVariation.alpha,
                     1
                 )
-                let alpha = baseAlpha
+                let mouthCameraCoverage: Float
+                if trustedCameraSample != nil,
+                   style.shadingDebugMode != .capturedShape {
+                    mouthCameraCoverage = Self.innerMouthCameraCoverage(
+                        base: lipBase,
+                        topV: topV,
+                        opening: sampler.innerApertureVisibility
+                    )
+                } else {
+                    mouthCameraCoverage = 1
+                }
+                let alpha = baseAlpha * mouthCameraCoverage
                 let pigmentRGB = Self.sRGBToLinear(style.color)
                 if let cameraSample = trustedCameraSample {
                     toneMap[mapIndex] = Self.cameraTone(
@@ -768,6 +779,7 @@ final class LipTextureRenderer {
                 let shineGeometry = sampler.shineGeometry(u: u, topV: topV)
                 materialInputs[mapIndex] = PixelMaterialInput(
                     alpha: alpha,
+                    recessShade: sample.recessShade,
                     lipBase: lipBase,
                     highlightSurround:
                         trustedCameraSample?.highlightSurround ?? lipBase,
@@ -801,7 +813,7 @@ final class LipTextureRenderer {
             guard effectiveAlpha > 0.006 else {
                 continue
             }
-            let materialRGB = Self.materialColor(
+            let baseMaterialRGB = Self.materialColor(
                 pigment: input.pigment,
                 base: input.lipBase,
                 highlightSurround: input.highlightSurround,
@@ -814,6 +826,11 @@ final class LipTextureRenderer {
                 finish: style.finish,
                 materialProfile: style.materialProfile,
                 shadingDebugMode: style.shadingDebugMode
+            )
+            let materialRGB = RGBColor(
+                red: baseMaterialRGB.red * input.recessShade,
+                green: baseMaterialRGB.green * input.recessShade,
+                blue: baseMaterialRGB.blue * input.recessShade
             )
             let materialOpacity = style.materialProfile.pigmentCoverage /
                 LipstickDensity.high.pigmentCoverage
@@ -867,7 +884,8 @@ final class LipTextureRenderer {
             &rgba,
             sampler: sampler,
             pixelWidth: pixelWidth,
-            pixelHeight: pixelHeight
+            pixelHeight: pixelHeight,
+            sampledPixels: usedFallback ? nil : activeTonePixels
         )
         // CanonicalAlphaSample already supplies a smooth distance feather.
         // A second CPU blur both delayed the live colour and washed out the
@@ -1254,11 +1272,16 @@ final class LipTextureRenderer {
                     renderCoverage *
                     tintDistribution
                 let lipBase = stableLipBaseColor(u: u, topV: topV)
-                let lipRGB = banubaBaseColor(
+                let baseLipRGB = banubaBaseColor(
                     cameraLinear: lipBase,
                     pigmentLinear: sRGBToLinear(color),
                     showsValueDebug:
                         shadingDebugMode == .capturedShape
+                )
+                let lipRGB = RGBColor(
+                    red: baseLipRGB.red * sample.recessShade,
+                    green: baseLipRGB.green * sample.recessShade,
+                    blue: baseLipRGB.blue * sample.recessShade
                 )
                 // Without a camera signal there is no defensible reflection
                 // position. Keep fallback pigment diffuse rather than drawing
@@ -1285,7 +1308,8 @@ final class LipTextureRenderer {
         _ rgba: inout [UInt8],
         sampler: CanonicalLipSampler,
         pixelWidth: Int,
-        pixelHeight: Int
+        pixelHeight: Int,
+        sampledPixels: [Bool]? = nil
     ) -> Int {
         guard pixelWidth > 1,
               pixelHeight > 1,
@@ -1299,6 +1323,13 @@ final class LipTextureRenderer {
             for x in 0..<pixelWidth {
                 let targetOffset = (y * pixelWidth + x) * 4
                 guard source[targetOffset + 3] == 0 else {
+                    continue
+                }
+                // A sampled tooth pixel can intentionally round to zero alpha.
+                // Only recover missing samples, never refill that exclusion.
+                if let sampledPixels,
+                   sampledPixels.indices.contains(y * pixelWidth + x),
+                   sampledPixels[y * pixelWidth + x] {
                     continue
                 }
                 let u = (CGFloat(x) + 0.5) / CGFloat(pixelWidth)
@@ -1879,10 +1910,7 @@ final class LipTextureRenderer {
                                          innerDistance: CGFloat,
                                          finish: LipFinish) -> Float {
         let innerDistance = Float(innerDistance)
-        // The canonical mask owns the aperture-side feather for every finish.
-        // Applying a second material fade reveals a bright camera seam along
-        // the line of lip closure and at the corners.
-        let innerFade: Float = 1
+        // The shared mask already includes the wet-line density roll-off.
         let finishDistribution = finish == .tint ?
             Self.tintDistribution(
                 outerDistance: outerDistance,
@@ -1894,10 +1922,27 @@ final class LipTextureRenderer {
         // instead of being cancelled out by colour compensation.
         return clamp01(
             maskAlpha *
-                innerFade *
                 finishDistribution *
                 LipstickDensity.high.pigmentCoverage
         )
+    }
+
+    private static func innerMouthCameraCoverage(
+        base: RGBColor,
+        topV: CGFloat,
+        opening: CGFloat
+    ) -> Float {
+        let srgb = linearToSRGB(base)
+        let maximum = max(srgb.red, max(srgb.green, srgb.blue))
+        let minimum = min(srgb.red, min(srgb.green, srgb.blue))
+        let saturation = maximum > 0.001 ? (maximum - minimum) / maximum : 0
+        let luma = srgb.red * 0.299 + srgb.green * 0.587 + srgb.blue * 0.114
+        let toothProbability = smoothStep((luma - 0.64) / 0.18) *
+            (1 - smoothStep((saturation - 0.16) / 0.14))
+        let seamRegion = 1 - smoothStep((abs(Float(topV) - 0.50) - 0.018) / 0.067)
+        let toothGuard = toothProbability * seamRegion *
+            smoothStep((Float(opening) - 0.24) / 0.22)
+        return 1 - toothGuard * 0.98
     }
 
     /// One at the inner lip boundary and progressively softer toward the

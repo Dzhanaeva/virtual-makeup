@@ -19,7 +19,7 @@ Current core technologies:
 - `UIViewRepresentable` bridge for `ARSCNView`.
 - ARKit face tracking and SceneKit rendering for camera, face anchor, occlusion, and lip mesh.
 - MediaPipe Tasks Vision `FaceLandmarker` for live lip landmark detection.
-- Metal and Metal Performance Shaders for camera-aware lipstick colour, linear-RGB light and
+- Metal for camera-aware lipstick colour, linear-RGB light and
   shadow processing with sRGB input/output, texture preservation, a temporally stabilized
   camera-derived shine mask, and the feathered lip alpha mask; the legacy CPU compositor is
   fallback-only and follows the same colour-space and material-signal contract.
@@ -41,9 +41,17 @@ Current core technologies:
   shared by the Metal and CPU compositors.
 - `Virtual Makeup/LipModels.swift` and `CanonicalLipGeometry.swift`: lip/face geometry data,
   coordinate transforms, canonical topology, and mesh lookup data.
+- `Virtual Makeup/LipTemporalStability.swift`: frame-rate-independent lip filter response,
+  noise-floor-adjusted activity, rigid display lead, and camera-plane inverse projection math.
+- `Virtual Makeup/LipDiagnostics.swift`: throttled debug output and Release-available
+  performance logging for power/thermal state, frame rates, and contour health.
+- `Virtual Makeup/LipInnerBoundary.swift`: shared inner lip coverage and recessed-colour
+  profile, including a full closed-mouth fill, the open-mouth cutout, and
+  hysteretic ARKit mouth-closure classification.
 - `Virtual Makeup/LipMeshRenderer.swift`, `LipTextureRenderer.swift`, and
   `MetalLipColorCompositor.swift`: SceneKit geometry, camera-aware lipstick rendering, and the
-  independent soft lip liner material.
+  independent soft lip liner material. The Metal compositor applies one analytic outer alpha
+  curve, then a bounded outer-only blur that cannot raise its coverage or refill the mouth.
 - `Virtual Makeup/BlushRenderer.swift`: SceneKit blush rendering.
 - `Virtual Makeup/VirtualMakeup-Bridging-Header.h`: Objective-C bridging header configured in
   the Xcode project.
@@ -79,6 +87,27 @@ There is currently no dedicated test target. When extracting pure logic from the
 geometry, or rendering units, add focused tests for deterministic geometry, color, smoothing,
 and texture math.
 
+For the inner lip coverage and colour profile, run the standalone check from the repository root:
+
+```sh
+xcrun swiftc -module-cache-path /tmp/virtual-makeup-swift-cache "Virtual Makeup/LipInnerBoundary.swift" scripts/check_lip_inner_boundary.swift -o /tmp/virtual-makeup-inner-boundary-check
+/tmp/virtual-makeup-inner-boundary-check
+```
+
+It checks the CPU profile across mouth openings and lip thicknesses, and compares it with
+the production Metal functions across texture scales when a Metal GPU is available.
+
+For temporal stability and source-frame projection math:
+
+```sh
+xcrun swiftc -module-cache-path /tmp/virtual-makeup-swift-cache "Virtual Makeup/LipTemporalStability.swift" scripts/check_lip_temporal_stability.swift -o /tmp/virtual-makeup-temporal-check
+/tmp/virtual-makeup-temporal-check
+```
+
+This deterministic check compares the old and current rigid lead, verifies matching
+activity and filter response at 15/30/60 Hz, and measures synthetic yaw/pitch parallax. Real camera
+alignment and display-image latency still require on-device capture.
+
 For the lip-only CoreML training utilities:
 
 ```sh
@@ -92,6 +121,17 @@ python3 ml-training/scripts/smoke_test.py
   the `UIViewRepresentable` bridge.
 - Treat `Coordinator` as the boundary for ARKit, MediaPipe delegate callbacks, and rendering state.
   Avoid pushing UI-only concerns into it.
+- In the screen-space lip path, retain the MediaPipe contour with the ARKit pose
+  from its source frame. Move it with the current rendered face pose and the
+  same transport for reliability checks, smoothing, and display. At yaw/pitch,
+  use per-point source-frame ARKit face depth with exact source reprojection;
+  fall back to the fixed face-local screen basis or bounded similarity transform
+  if depth is unavailable. The MediaPipe facial matrix belongs to its captured
+  frame and is only required for the face-surface path.
+- Derive adaptive smoothing activity from successive accepted raw MediaPipe
+  contours after rigid transport. Keep the per-observation noise floor before
+  converting residual displacement to a rate; apply elapsed-time response to
+  confidence and alpha as well.
 - Keep real-time paths small and predictable. Do not block ARKit renderer callbacks, AR session
   callbacks, or MediaPipe delegate queues with heavy synchronous work.
 - Preserve the existing queue/lock model unless replacing it with a clearly safer concurrency
@@ -133,6 +173,13 @@ python3 ml-training/scripts/smoke_test.py
   `waitUntilCompleted`. Temporal resets invalidate outstanding shine-history completions.
 - Keep UIKit screen/window reads in SwiftUI or the view's main-thread layout callbacks; cache
   the resulting viewport/display values for SceneKit's rendering queue.
+- Update the screen-space lip mesh in SceneKit's per-frame
+  `didApplyAnimationsAtTime` phase; face-anchor callbacks cache the latest tracked
+  anchor and node. Compute rigid prediction only for new, timestamped ARFrame
+  poses whose camera transform matches the renderer camera, and hold its lead
+  across duplicate render callbacks. Hide the mesh if camera frame updates stop.
+  Treat ARFrame capture timestamps separately
+  from the unknown presentation timestamp of ARSCNView's camera background.
 - Clear SceneKit nodes and tracking state when anchors are removed, sessions stop, tracking is lost,
   or detection becomes stale.
 

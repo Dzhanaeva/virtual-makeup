@@ -110,6 +110,8 @@ struct LipContour {
     var outerUV: [CGPoint] = []
     var innerUV: [CGPoint] = []
     var meshPointsByIndex: [Int: LipMeshPoint] = [:]
+    // MediaPipe X/Y unprojected at per-point ARKit face depth in the source frame.
+    var rigidLocalPointsByIndex: [Int: SIMD3<Float>] = [:]
     var surfaceBindingsByIndex: [Int: LipSurfaceBinding] = [:]
     var surfaceVertexCount: Int? = nil
     var surfaceTriangleIndexCount: Int? = nil
@@ -269,6 +271,54 @@ struct LipContour {
             )
         }
 
+        return transformedScreenPoints(transform)
+    }
+
+    func rigidlyTransformed(from source: LipMotionPose,
+                            to target: LipMotionPose) -> LipContour? {
+        guard let sourceBasis = source.screenBasis,
+              let targetBasis = target.screenBasis else {
+            return nil
+        }
+        let determinant = sourceBasis.x.dx * sourceBasis.y.dy -
+            sourceBasis.x.dy * sourceBasis.y.dx
+        let minimumDeterminant = source.width * source.width * 0.015
+        guard determinant.isFinite,
+              abs(determinant) > minimumDeterminant else {
+            return nil
+        }
+
+        func transform(_ point: CGPoint) -> CGPoint {
+            let dx = point.x - source.center.x
+            let dy = point.y - source.center.y
+            let x = (dx * sourceBasis.y.dy - dy * sourceBasis.y.dx) /
+                determinant
+            let y = (sourceBasis.x.dx * dy - sourceBasis.x.dy * dx) /
+                determinant
+            return CGPoint(
+                x: target.center.x + x * targetBasis.x.dx + y * targetBasis.y.dx,
+                y: target.center.y + x * targetBasis.x.dy + y * targetBasis.y.dy
+            )
+        }
+
+        let similarity = transformed(
+            from: LipPose(center: source.center, width: source.width, angle: source.angle),
+            to: LipPose(center: target.center, width: target.width, angle: target.angle)
+        )
+        let maximumCorrection = min(max(target.width * 0.15, 2), 12)
+        for (point, baseline) in zip(outer + inner, similarity.outer + similarity.inner) {
+            let mapped = transform(point)
+            let correction = hypot(mapped.x - baseline.x, mapped.y - baseline.y)
+            guard correction.isFinite, correction <= maximumCorrection else {
+                return nil
+            }
+        }
+        return transformedScreenPoints(transform)
+    }
+
+    private func transformedScreenPoints(
+        _ transform: (CGPoint) -> CGPoint
+    ) -> LipContour {
         return LipContour(
             outer: outer.map(transform),
             inner: inner.map(transform),
@@ -283,6 +333,7 @@ struct LipContour {
                     uv: $0.uv
                 )
             },
+            rigidLocalPointsByIndex: rigidLocalPointsByIndex,
             surfaceBindingsByIndex: surfaceBindingsByIndex,
             surfaceVertexCount: surfaceVertexCount,
             surfaceTriangleIndexCount: surfaceTriangleIndexCount,
@@ -381,6 +432,7 @@ struct LipContour {
             outerUV: outerUV,
             innerUV: innerUV,
             meshPointsByIndex: transformedMeshPoints,
+            rigidLocalPointsByIndex: rigidLocalPointsByIndex,
             surfaceBindingsByIndex: surfaceBindingsByIndex,
             surfaceVertexCount: surfaceVertexCount,
             surfaceTriangleIndexCount: surfaceTriangleIndexCount,
@@ -466,6 +518,7 @@ struct LipContour {
             outerUV: outerUV,
             innerUV: innerUV,
             meshPointsByIndex: offsetMeshPoints,
+            rigidLocalPointsByIndex: rigidLocalPointsByIndex,
             surfaceBindingsByIndex: surfaceBindingsByIndex,
             surfaceVertexCount: surfaceVertexCount,
             surfaceTriangleIndexCount: surfaceTriangleIndexCount,
@@ -559,69 +612,29 @@ struct LipPose {
 }
 
 enum LipOuterMargin {
-    // These fractions preserve the tuned margins around an 80-point mouth,
-    // but shrink with the detected lip contour when the face moves away.
-    // Absolute upper bounds keep close-up faces from producing oversized
-    // textures or SceneKit carrier geometry.
+    // Preserve the tuned 4-point carrier around an 80-point mouth, then
+    // shrink it with the contour so distant lips do not gain a fixed halo.
     private static let samplingFraction: CGFloat = 0.075
-    // The carrier needs only a compact strip outside the real lip. Earlier
-    // 10-14 point margins were tuned while the alpha map was not applied and
-    // made any transparency failure look like a much larger painted lip.
-    private static let carrierFraction: CGFloat = 0.030
+    private static let carrierFraction: CGFloat = 0.035
 
     static func sampling(for lipWidth: CGFloat) -> CGFloat {
         min(max(lipWidth, 0) * samplingFraction, 10)
     }
 
     static func carrier(for lipWidth: CGFloat) -> CGFloat {
-        let scaledMargin = max(lipWidth, 0) * carrierFraction
-        guard scaledMargin > 0 else {
-            return 0
-        }
-        return min(max(scaledMargin, 3.5), 5.0)
+        let width = max(lipWidth, 0)
+        let scaledMargin = width * carrierFraction
+        guard scaledMargin > 0 else { return 0 }
+        let minimumMargin = min(width * 0.05, 4.0)
+        return min(max(scaledMargin, minimumMargin), 6.0)
     }
 }
 
 enum LipOuterFeatherLayout {
-    // Both the Metal colour raster and the SceneKit carrier must address the
-    // same transparent area of the generated texture. Keep these values in
-    // one place so changing one renderer cannot silently clip the other.
-    // Distance is measured in canonical texture-height units. Outer UVs are
-    // expanded along contour normals, so every carrier vertex lands beyond
-    // the alpha tail rather than relying on an approximate radial scale.
     static let canonicalCarrierDistance: CGFloat = 0.052
     static let canonicalTextureAspectRatio: CGFloat = 2.0
-
-    // Soften only a one-pixel rim inside the real lip, then fade through the
-    // compact exterior carrier. Spare transparent texels before the carrier
-    // boundary prevent texture filtering from exposing a hard polygon edge.
     static let interiorTransitionPixels: Float = 8
-    static let exteriorTransitionPixels: Float = 4.0
-}
-
-enum LipInnerBoundaryLayout {
-    // Define the wet-line reach against the same 96 px reference used by the
-    // Metal mask. The CPU and GPU paths then expose an identical part of the
-    // inner carrier instead of producing different mouth edges after fallback.
-    private static let referenceTextureHeight: CGFloat = 96
-
-    static func solidCoveragePixels(opening: CGFloat) -> CGFloat {
-        let clampedOpening = min(max(opening, 0), 1)
-        return 1.55 - clampedOpening * 1.47
-    }
-
-    static func transitionPixels(opening: CGFloat) -> CGFloat {
-        let clampedOpening = min(max(opening, 0), 1)
-        return 0.75 - clampedOpening * 0.40
-    }
-
-    static func normalizedSolidCoverage(opening: CGFloat) -> CGFloat {
-        solidCoveragePixels(opening: opening) / referenceTextureHeight
-    }
-
-    static func normalizedTransition(opening: CGFloat) -> CGFloat {
-        transitionPixels(opening: opening) / referenceTextureHeight
-    }
+    static let exteriorTransitionPixels: Float = 2
 }
 
 enum LipOuterBoundary {
@@ -780,6 +793,11 @@ enum LipOuterBoundary {
     }
 }
 
+struct LipRigidScreenBasis {
+    let x: CGVector
+    let y: CGVector
+}
+
 struct LipMotionPose {
     let center: CGPoint
     let width: CGFloat
@@ -790,6 +808,8 @@ struct LipMotionPose {
     let pucker: CGFloat
     let upperRaise: CGFloat
     let lowerDrop: CGFloat
+    var screenBasis: LipRigidScreenBasis? = nil
+    var displayLead: CGVector = .zero
 
     init(center: CGPoint,
          width: CGFloat,
@@ -902,13 +922,10 @@ struct LipMotionPose {
     }
 
     var isConfidentlyClosedMouth: Bool {
-        // A smile separates ARKit's geometric lip vertices slightly even when
-        // there is no real mouth opening. Raise the geometric close threshold
-        // with smile intensity and require the independent jaw blendshape to
-        // agree before closing the rendered aperture.
-        let smileAmount = min(max(smile, 0), 1)
-        let geometricCloseThreshold = 0.005 + smileAmount * 0.020
-        return jawOpen < 0.055 && opening < geometricCloseThreshold
+        LipMouthClosure.isClosed(
+            arOpening: opening, jawOpen: jawOpen, smile: smile,
+            detectedOpening: nil, wasClosed: nil
+        )
     }
 }
 
