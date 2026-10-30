@@ -758,7 +758,13 @@ enum LipOuterBoundary {
             scaledPoints[index] = CGPoint(x: uv.x * aspectRatio, y: uv.y)
         }
 
-        let scaledCenter = CGPoint(x: 0.5 * aspectRatio, y: 0.5)
+        let scaledCenter = scaledPoints.values.reduce(CGPoint.zero) { sum, point in
+            CGPoint(x: sum.x + point.x, y: sum.y + point.y)
+        }
+        let center = CGPoint(
+            x: scaledCenter.x / CGFloat(indices.count),
+            y: scaledCenter.y / CGFloat(indices.count)
+        )
         var normals: [Int: CGVector] = [:]
         normals.reserveCapacity(indices.count)
         for offset in indices.indices {
@@ -781,8 +787,8 @@ enum LipOuterBoundary {
 
             var normalX = -tangentY / tangentLength
             var normalY = tangentX / tangentLength
-            let radialX = point.x - scaledCenter.x
-            let radialY = point.y - scaledCenter.y
+            let radialX = point.x - center.x
+            let radialY = point.y - center.y
             if normalX * radialX + normalY * radialY < 0 {
                 normalX = -normalX
                 normalY = -normalY

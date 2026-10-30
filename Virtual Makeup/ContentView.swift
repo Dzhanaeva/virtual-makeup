@@ -492,6 +492,37 @@ struct ContentView: View {
                 )
             ]
         ),
+        LipProduct(
+            id: "dior-shimmer",
+            placeholderNumber: 15,
+            name: "Блеск-плампер Dior Addict",
+            finish: .shimmer,
+            density: .medium,
+            texture: .liquid,
+            shades: [
+                LipShade(
+                    productID: "VM-1015-045",
+                    name: "045 Ореховый шиммер",
+                    color: LipstickColor(sourceSRGBHex: 0xA6593F)
+                )
+            ]
+        ),
+        
+        LipProduct(
+            id: "loreal-lip",
+            placeholderNumber: 15,
+            name: "Сатиновая помада Loreal Paris",
+            finish: .satin,
+            density: .high,
+            texture: .liquid,
+            shades: [
+                LipShade(
+                    productID: "VM-1015-412",
+                    name: "412",
+                    color: LipstickColor(sourceSRGBHex: 0x7D0308)
+                )
+            ]
+        ),
     ]
 
     private let blushPresets: [BlushPreset] = [
@@ -788,7 +819,20 @@ struct ContentView: View {
                                         .fill(Color(shade.color.uiColor))
                                         .frame(width: 40, height: 40)
                                         .overlay(alignment: .topLeading) {
-                                            if selectedLipProduct.finish.isWet {
+                                            if selectedLipProduct.finish == .shimmer {
+                                                Capsule()
+                                                    .fill(LinearGradient(
+                                                        colors: [
+                                                            Color(red: 1, green: 0.86, blue: 0.72),
+                                                            Color(red: 0.86, green: 0.79, blue: 1)
+                                                        ],
+                                                        startPoint: .leading,
+                                                        endPoint: .trailing
+                                                    ))
+                                                    .frame(width: 19, height: 5)
+                                                    .rotationEffect(.degrees(-24))
+                                                    .offset(x: 8, y: 8)
+                                            } else if selectedLipProduct.finish.isWet {
                                                 Capsule()
                                                     .fill(.white.opacity(0.68))
                                                     .frame(width: 17, height: 6)

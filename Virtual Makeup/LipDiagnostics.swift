@@ -1,5 +1,6 @@
 import Foundation
 import QuartzCore
+import UIKit
 import os
 
 enum LipDebugLog {
@@ -20,6 +21,110 @@ enum LipDebugLog {
         lock.unlock()
         print(message())
 
+    }
+}
+
+/// Measures movement of the strongest reflection region in canonical lip pixels.
+/// Sampling and logging are bounded so this can run in ordinary builds.
+enum LipHighlightMotionDiagnostics {
+    private static let lock = NSLock()
+    private static var lastSampleAt: CFTimeInterval = 0
+    private static var windowStartedAt: CFTimeInterval = 0
+    private static var source = ""
+    private static var finish: LipFinish?
+    private static var size = CGSize.zero
+    private static var previousCenter: CGPoint?
+    private static var sampleCount = 0
+    private static var visibleCount = 0
+    private static var moveCount = 0
+    private static var moveDistance = 0.0
+
+    static func shouldSample(at now: CFTimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now - lastSampleAt >= 0.10 else { return false }
+        lastSampleAt = now
+        return true
+    }
+
+    static func record(_ mask: [Float], width: Int, height: Int,
+                       finish newFinish: LipFinish, source newSource: String,
+                       at now: CFTimeInterval) {
+        guard width > 0, height > 0, mask.count == width * height else { return }
+        let peak = mask.reduce(Float.zero) { current, value in
+            value.isFinite ? max(current, value) : current
+        }
+        var center: CGPoint?
+        if peak >= 0.015 {
+            let cutoff = max(0.010, peak * 0.65)
+            var weightSum = 0.0
+            var weightedX = 0.0
+            var weightedY = 0.0
+            for (index, value) in mask.enumerated() {
+                let weight = Double(max(value - cutoff, 0))
+                guard weight.isFinite, weight > 0 else { continue }
+                weightSum += weight
+                weightedX += (Double(index % width) + 0.5) * weight
+                weightedY += (Double(index / width) + 0.5) * weight
+            }
+            if weightSum > 0 {
+                center = CGPoint(x: weightedX / weightSum,
+                                 y: weightedY / weightSum)
+            }
+        }
+
+        lock.lock()
+        if source != newSource || finish != newFinish ||
+            size != CGSize(width: width, height: height) ||
+            windowStartedAt == 0 || now - windowStartedAt > 2 {
+            source = newSource
+            finish = newFinish
+            size = CGSize(width: width, height: height)
+            previousCenter = nil
+            sampleCount = 0
+            visibleCount = 0
+            moveCount = 0
+            moveDistance = 0
+            windowStartedAt = now
+        }
+        sampleCount += 1
+        if let center {
+            visibleCount += 1
+            if let previousCenter {
+                let distance = hypot(Double(center.x - previousCenter.x),
+                                     Double(center.y - previousCenter.y))
+                if distance >= 1.5 {
+                    moveCount += 1
+                    moveDistance += distance
+                }
+            }
+        }
+        previousCenter = center
+        let elapsed = now - windowStartedAt
+        guard elapsed >= 1 else {
+            lock.unlock()
+            return
+        }
+        let samples = sampleCount
+        let visible = visibleCount
+        let moves = moveCount
+        let averageMove = moveCount > 0 ? moveDistance / Double(moveCount) : 0
+        windowStartedAt = now
+        sampleCount = 0
+        visibleCount = 0
+        moveCount = 0
+        moveDistance = 0
+        lock.unlock()
+
+        let centerText = center.map {
+            String(format: "%.3f,%.3f", Double($0.x) / Double(width),
+                   Double($0.y) / Double(height))
+        } ?? "none"
+        print(String(format:
+            "lip_highlight_motion finish=%@ source=%@ sampleHz=%.1f visible=%d/%d changesPerSec=%.1f avgMovePx=%.2f centerUV=%@ peak=%.3f",
+            newFinish.displayName, newSource, Double(samples) / elapsed,
+            visible, samples, Double(moves) / elapsed, averageMove,
+            centerText, Double(peak)))
     }
 }
 
@@ -82,6 +187,9 @@ final class LipPerformanceDiagnostics {
         let mediaPipeFPS: Double
         let minimumLandmarkSubmitInterval: CFTimeInterval
         let contourAge: CFTimeInterval?
+        let cameraAge: CFTimeInterval?
+        let renderAge: CFTimeInterval?
+        let mediaPipeAge: CFTimeInterval?
         let landmarkSkips: Int
         let resultRejects: Int
         let contourMisses: Int
@@ -108,6 +216,9 @@ final class LipPerformanceDiagnostics {
     private var renderFrames = 0
     private var mediaPipeResults = 0
     private var lastCameraFrameTimestamp: TimeInterval?
+    private var lastCameraFrameAt: CFTimeInterval?
+    private var lastRenderFrameAt: CFTimeInterval?
+    private var lastMediaPipeResultAt: CFTimeInterval?
     private var requestedCameraFPS = 0
     private var requestedRenderFPS = 0
     private var minimumLandmarkSubmitInterval: CFTimeInterval = 0
@@ -126,6 +237,9 @@ final class LipPerformanceDiagnostics {
         renderFrames = 0
         mediaPipeResults = 0
         lastCameraFrameTimestamp = nil
+        lastCameraFrameAt = nil
+        lastRenderFrameAt = nil
+        lastMediaPipeResultAt = nil
         latestContourCaptureTime = nil
         landmarkSkips = 0
         resultRejects = 0
@@ -147,8 +261,16 @@ final class LipPerformanceDiagnostics {
                 forName: ProcessInfo.thermalStateDidChangeNotification,
                 object: nil, queue: nil
             ) { [weak self] _ in self?.report(reason: "thermal_state_changed") }
+            let background = center.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil, queue: nil
+            ) { [weak self] _ in self?.report(reason: "app_background") }
+            let active = center.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil, queue: nil
+            ) { [weak self] _ in self?.report(reason: "app_active") }
             lock.lock()
-            observers = [power, thermal]
+            observers = [power, thermal, background, active]
             lock.unlock()
         }
         lock.lock()
@@ -186,19 +308,26 @@ final class LipPerformanceDiagnostics {
            lastCameraFrameTimestamp.map({ timestamp > $0 + 0.0005 }) ?? true {
             cameraFrames += 1
             lastCameraFrameTimestamp = timestamp
+            lastCameraFrameAt = CACurrentMediaTime()
         }
         lock.unlock()
     }
 
     func recordRenderFrame() {
         lock.lock()
-        if isRunning { renderFrames += 1 }
+        if isRunning {
+            renderFrames += 1
+            lastRenderFrameAt = CACurrentMediaTime()
+        }
         lock.unlock()
     }
 
     func recordMediaPipeResult() {
         lock.lock()
-        if isRunning { mediaPipeResults += 1 }
+        if isRunning {
+            mediaPipeResults += 1
+            lastMediaPipeResultAt = CACurrentMediaTime()
+        }
         lock.unlock()
     }
 
@@ -263,6 +392,9 @@ final class LipPerformanceDiagnostics {
             mediaPipeFPS: Double(mediaPipeResults) / duration,
             minimumLandmarkSubmitInterval: minimumLandmarkSubmitInterval,
             contourAge: age,
+            cameraAge: lastCameraFrameAt.map { max(now - $0, 0) },
+            renderAge: lastRenderFrameAt.map { max(now - $0, 0) },
+            mediaPipeAge: lastMediaPipeResultAt.map { max(now - $0, 0) },
             landmarkSkips: landmarkSkips,
             resultRejects: resultRejects,
             contourMisses: contourMisses,
@@ -292,14 +424,24 @@ final class LipPerformanceDiagnostics {
             let age = snapshot.contourAge.map {
                 String(format: "%.1f", $0 * 1000)
             } ?? "none"
+            let cameraAge = snapshot.cameraAge.map {
+                String(format: "%.1f", $0 * 1000)
+            } ?? "none"
+            let renderAge = snapshot.renderAge.map {
+                String(format: "%.1f", $0 * 1000)
+            } ?? "none"
+            let mediaPipeAge = snapshot.mediaPipeAge.map {
+                String(format: "%.1f", $0 * 1000)
+            } ?? "none"
             let line = String(
-                format: "lip_performance timestamp=%@ build=%@ reason=%@ lowPower=%@ thermalState=%@ requestedCameraFPS=%d requestedRenderFPS=%d actualCameraFPS=%.1f actualRenderFPS=%.1f actualMediaPipeFPS=%.1f lastSelectedMinimumLandmarkSubmitIntervalMs=%.1f contourAgeMs=%@ landmarkSkips=%d resultRejects=%d contourMisses=%d consecutiveContourMisses=%d",
+                format: "lip_performance timestamp=%@ build=%@ reason=%@ lowPower=%@ thermalState=%@ requestedCameraFPS=%d requestedRenderFPS=%d actualCameraFPS=%.1f actualRenderFPS=%.1f actualMediaPipeFPS=%.1f lastSelectedMinimumLandmarkSubmitIntervalMs=%.1f contourAgeMs=%@ cameraAgeMs=%@ renderAgeMs=%@ mediaPipeAgeMs=%@ landmarkSkips=%d resultRejects=%d contourMisses=%d consecutiveContourMisses=%d",
                 formatter.string(from: snapshot.timestamp),
                 buildIdentifier, snapshot.reason,
                 snapshot.lowPowerMode ? "true" : "false", thermal,
                 snapshot.requestedCameraFPS, snapshot.requestedRenderFPS,
                 snapshot.cameraFPS, snapshot.renderFPS, snapshot.mediaPipeFPS,
                 snapshot.minimumLandmarkSubmitInterval * 1000, age,
+                cameraAge, renderAge, mediaPipeAge,
                 snapshot.landmarkSkips, snapshot.resultRejects,
                 snapshot.contourMisses, snapshot.consecutiveContourMisses
             )

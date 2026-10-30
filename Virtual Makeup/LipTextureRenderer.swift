@@ -13,6 +13,7 @@ final class LipTextureRenderer {
         let base: RGBColor
         let blurred: RGBColor
         let highlightSurround: RGBColor
+        let highlightConfidence: Float
     }
 
     private struct CameraMaterialSignals {
@@ -29,6 +30,7 @@ final class LipTextureRenderer {
 
     private struct PixelMaterialInput {
         let alpha: Float
+        let pigmentDistribution: Float
         let recessShade: Float
         let lipBase: RGBColor
         let highlightSurround: RGBColor
@@ -38,6 +40,18 @@ final class LipTextureRenderer {
         let lowerLipMembership: Float
         let outerDistance: CGFloat
         let innerDistance: CGFloat
+        let opticalSurface: LipOpticalSurface.Sample?
+    }
+
+    private struct MaterialAppearance {
+        let pigment: RGBColor
+        let reflection: RGBColor
+        let reflectionCoverage: Float
+    }
+
+    private struct ShimmerLayer {
+        let color: RGBColor
+        let coverage: Float
     }
 
     private struct ProceduralTextureKey: Equatable {
@@ -62,6 +76,7 @@ final class LipTextureRenderer {
 
     private let temporalTextureLock = NSLock()
     private var previousToneMap: [CameraMaterialSignals]?
+    private var previousShineConfidence: [Float]?
     private var previousToneMapWidth = 0
     private var previousToneMapHeight = 0
     private var previousToneColor: RGBColor?
@@ -81,6 +96,8 @@ final class LipTextureRenderer {
     private var cachedProceduralTexture: LipTexture?
     private var cachedLinerMaskKey: LinerMaskKey?
     private var cachedLinerOpacityImage: UIImage?
+    private var previousLinerReferenceLuma: Float?
+    private var previousLinerReferenceTime: CFTimeInterval?
 
     private struct CanonicalLipSample {
         let point: CGPoint
@@ -114,7 +131,9 @@ final class LipTextureRenderer {
         private let excludesInnerMouth: Bool
         let innerApertureVisibility: CGFloat
 
-        init?(contour: LipContour, excludesInnerMouth: Bool) {
+        init?(contour: LipContour,
+              excludesInnerMouth: Bool,
+              expandsCameraCarrier: Bool = false) {
             guard contour.outer.count == 20,
                   contour.inner.count == 20,
                   contour.outerUV.count == 20,
@@ -125,9 +144,24 @@ final class LipTextureRenderer {
             var builtVertices: [UVVertex] = []
             var builtTriangles: [(Int, Int, Int)] = []
             var vertexIndexByLandmark: [Int: Int] = [:]
+            let expandedUV = expandsCameraCarrier ?
+                LipOuterBoundary.expandedUVPoints(
+                    contour: contour,
+                    distance: LipOuterFeatherLayout.canonicalCarrierDistance,
+                    aspectRatio: LipOuterFeatherLayout.canonicalTextureAspectRatio
+                ) ?? [:] : [:]
+            let expandedScreen = expandsCameraCarrier ?
+                LipOuterBoundary.expandedScreenPoints(
+                    contour: contour,
+                    distance: LipOuterMargin.sampling(for: contour.pose?.width ?? 0)
+                ) ?? [:] : [:]
 
             func vertex(for landmarkIndex: Int) -> UVVertex? {
                 if let point = contour.meshPointsByIndex[landmarkIndex] {
+                    if let uv = expandedUV[landmarkIndex],
+                       let screen = expandedScreen[landmarkIndex] {
+                        return UVVertex(uv: uv, screen: screen)
+                    }
                     if CanonicalLipGeometry.isInnerLipIndex(landmarkIndex) {
                         return UVVertex(
                             uv: point.uv,
@@ -140,7 +174,10 @@ final class LipTextureRenderer {
                 if let outerOffset = CanonicalLipGeometry.outerLipIndices.firstIndex(of: landmarkIndex),
                    contour.outerUV.indices.contains(outerOffset),
                    contour.outer.indices.contains(outerOffset) {
-                    return UVVertex(uv: contour.outerUV[outerOffset], screen: contour.outer[outerOffset])
+                    return UVVertex(
+                        uv: expandedUV[landmarkIndex] ?? contour.outerUV[outerOffset],
+                        screen: expandedScreen[landmarkIndex] ?? contour.outer[outerOffset]
+                    )
                 }
 
                 if let innerOffset = CanonicalLipGeometry.innerLipIndices.firstIndex(of: landmarkIndex),
@@ -290,7 +327,7 @@ final class LipTextureRenderer {
             )
         }
 
-        private func screenPoint(u: CGFloat, topV: CGFloat) -> CGPoint? {
+        func screenPoint(u: CGFloat, topV: CGFloat) -> CGPoint? {
             let uv = CGPoint(x: max(0, min(u, 1)), y: 1 - max(0, min(topV, 1)))
             for triangle in triangles {
                 let first = vertices[triangle.0]
@@ -358,6 +395,45 @@ final class LipTextureRenderer {
                 opening: innerApertureVisibility
             )
             return coverage > 0.001 ? coverage : nil
+        }
+
+        func shimmerParticleInnerGate(u: CGFloat,
+                                      topV: CGFloat,
+                                      pixelWidth: Int,
+                                      pixelHeight: Int) -> Float {
+            guard excludesInnerMouth,
+                  innerApertureVisibility > 0.02,
+                  innerBoundary.count >= 3 else {
+                return 1
+            }
+            let uv = CGPoint(x: u, y: 1 - topV)
+            let opening = Self.smoothStep(
+                edge0: 0.02, edge1: 0.25, value: innerApertureVisibility
+            )
+            guard !Self.pointInPolygon(uv, polygon: innerBoundary) else {
+                return Float(1 - opening)
+            }
+            let point = CGPoint(x: u * CGFloat(pixelWidth),
+                                y: topV * CGFloat(pixelHeight))
+            let distanceSquared = innerBoundarySegments.reduce(
+                CGFloat.greatestFiniteMagnitude
+            ) { current, segment in
+                let first = CGPoint(x: segment.0.x * CGFloat(pixelWidth),
+                                    y: (1 - segment.0.y) * CGFloat(pixelHeight))
+                let second = CGPoint(x: segment.1.x * CGFloat(pixelWidth),
+                                     y: (1 - segment.1.y) * CGFloat(pixelHeight))
+                return min(current, Self.squaredDistance(
+                    from: point, to: (first, second)
+                ))
+            }
+            let scale = CGFloat(pixelHeight) /
+                LipInnerBoundaryLayout.referenceTextureHeight
+            let edgeFade = Self.smoothStep(
+                edge0: 2 * scale,
+                edge1: 6 * scale,
+                value: sqrt(distanceSquared)
+            )
+            return Float(1 - opening * (1 - edgeFade))
         }
 
         private static func mix(_ first: CGPoint, _ second: CGPoint, t: CGFloat) -> CGPoint {
@@ -520,6 +596,11 @@ final class LipTextureRenderer {
         metalCompositor.isAvailable
     }
 
+    var usesDynamicCameraReflections: Bool {
+        let finish = currentLipstickStyle().finish
+        return finish == .gloss || finish == .oil || finish == .satin
+    }
+
     @discardableResult
     func updateStyle(color: LipstickColor,
                      finish: LipFinish,
@@ -572,12 +653,15 @@ final class LipTextureRenderer {
         metalCompositor.resetTemporalState()
         temporalTextureLock.lock()
         previousToneMap = nil
+        previousShineConfidence = nil
         previousToneMapWidth = 0
         previousToneMapHeight = 0
         previousToneColor = nil
         previousToneMouthOpen = nil
         previousToneAverageLuma = nil
         previousToneReferenceLuma = nil
+        previousLinerReferenceLuma = nil
+        previousLinerReferenceTime = nil
         if !preservingProceduralTexture {
             cachedProceduralTextureKey = nil
             cachedProceduralTexture = nil
@@ -588,23 +672,36 @@ final class LipTextureRenderer {
     // Called on completionQueue with at most one texture request in flight.
     func makeTexture(contour: LipContour,
                      pixelBuffer: CVPixelBuffer,
+                     imageToViewportTransform: CGAffineTransform,
+                     linerStyle: LinerRenderStyle,
                      imageSize: CGSize,
                      viewportSize: CGSize,
                      renderScale: CGFloat,
                      excludesInnerMouth: Bool,
                      lightingFactor: CGFloat,
+                     viewYawDegrees: CGFloat,
+                     viewPitchDegrees: CGFloat,
                      lowLatency: Bool = false,
                      motionDelta: CGFloat = 0,
                      completionQueue: DispatchQueue,
                      completion: @escaping (LipTexture?) -> Void) {
         guard viewportSize.width > 1, viewportSize.height > 1,
-              imageSize.width > 1, imageSize.height > 1 else { completion(nil); return }
+              imageSize.width > 1, imageSize.height > 1,
+              LipCameraFrameMapping.isUsable(imageToViewportTransform) else {
+            completion(nil)
+            return
+        }
         let metalWasAvailable = metalCompositor.isAvailable
         func cpuFallback() -> LipTexture? {
             makeCPUTexture(contour: contour, pixelBuffer: pixelBuffer,
+                           imageToViewportTransform: imageToViewportTransform,
+                           linerStyle: linerStyle,
                            imageSize: imageSize, viewportSize: viewportSize,
                            renderScale: renderScale, excludesInnerMouth: excludesInnerMouth,
-                           lightingFactor: lightingFactor, lowLatency: lowLatency,
+                           lightingFactor: lightingFactor,
+                           viewYawDegrees: viewYawDegrees,
+                           viewPitchDegrees: viewPitchDegrees,
+                           lowLatency: lowLatency,
                            motionDelta: motionDelta, metalWasAvailable: metalWasAvailable)
         }
         guard metalWasAvailable else { completion(cpuFallback()); return }
@@ -612,19 +709,26 @@ final class LipTextureRenderer {
         let width = lowLatency ? 224 : 256
         let height = lowLatency ? 112 : 128
         metalCompositor.makeTexture(
-            contour: contour, pixelBuffer: pixelBuffer, imageSize: imageSize,
+            contour: contour, pixelBuffer: pixelBuffer,
+            imageToViewportTransform: imageToViewportTransform,
+            linerStyle: linerStyle,
+            imageSize: imageSize,
             viewportSize: viewportSize, pixelWidth: width, pixelHeight: height,
             renderScale: renderScale, color: style.color, lightingFactor: lightingFactor,
             finish: style.finish, materialProfile: style.materialProfile,
             shadingDebugMode: style.shadingDebugMode, lowLatency: lowLatency,
-            motionDelta: motionDelta, completionQueue: completionQueue
+            motionDelta: motionDelta,
+            viewYawDegrees: viewYawDegrees,
+            viewPitchDegrees: viewPitchDegrees,
+            completionQueue: completionQueue
         ) { [self] texture in
             if let texture {
                 LipDebugLog.throttled(
                     "lip_texture_path", interval: 1,
                     "lip_texture path=metal fallback=false async=true size=\(width)x\(height)"
                 )
-                completion(addingLinerMask(to: texture, contour: contour, renderScale: renderScale))
+                completion(addingLinerMask(to: texture, contour: contour,
+                    renderScale: renderScale, enabled: linerStyle.isEnabled))
             } else if !metalCompositor.isAvailable {
                 completion(cpuFallback())
             } else {
@@ -636,11 +740,15 @@ final class LipTextureRenderer {
 
     private func makeCPUTexture(contour: LipContour,
                      pixelBuffer: CVPixelBuffer,
+                     imageToViewportTransform: CGAffineTransform,
+                     linerStyle: LinerRenderStyle,
                      imageSize: CGSize,
                      viewportSize: CGSize,
                      renderScale: CGFloat,
                      excludesInnerMouth: Bool,
                      lightingFactor: CGFloat,
+                     viewYawDegrees: CGFloat,
+                     viewPitchDegrees: CGFloat,
                      lowLatency: Bool,
                      motionDelta: CGFloat,
                      metalWasAvailable: Bool) -> LipTexture? {
@@ -654,6 +762,7 @@ final class LipTextureRenderer {
             )
             return nil
         }
+        let opticalSurface = LipOpticalSurface(contour: contour)
 
         if Self.usesStableProceduralLipstickRenderer {
             LipDebugLog.throttled(
@@ -672,7 +781,8 @@ final class LipTextureRenderer {
             return addingLinerMask(
                 to: texture,
                 contour: contour,
-                renderScale: renderScale
+                renderScale: renderScale,
+                enabled: linerStyle.isEnabled
             )
         }
 
@@ -691,9 +801,17 @@ final class LipTextureRenderer {
             count: pixelWidth * pixelHeight
         )
         var activeTonePixels = [Bool](repeating: false, count: pixelWidth * pixelHeight)
+        var highlightMotionMask: [Float]? =
+            LipHighlightMotionDiagnostics.shouldSample(at: CACurrentMediaTime()) ?
+                [Float](repeating: 0, count: pixelWidth * pixelHeight) : nil
         var cameraLumaSum: Float = 0
         var cameraLumaCount: Float = 0
-        let inverseImageTransform = Self.aspectFillTransform(for: imageSize, in: viewportSize).inverted()
+        let legacyInverse = Self.aspectFillTransform(for: imageSize,
+                                                     in: viewportSize).inverted()
+        let usesCameraHighlight = style.finish == .gloss ||
+            style.finish == .oil || style.finish == .satin
+        let inverseImageTransform = usesCameraHighlight ?
+            imageToViewportTransform.inverted() : legacyInverse
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
@@ -721,6 +839,8 @@ final class LipTextureRenderer {
                 }
                 alphaPixels += 1
                 let mapIndex = y * pixelWidth + x
+                let wetSurface = usesCameraHighlight ?
+                    opticalSurface?.sample(at: sample.point) : nil
 
                 let cameraSample: CameraLipSample?
                 if let baseAddress {
@@ -730,7 +850,12 @@ final class LipTextureRenderer {
                         baseAddress: baseAddress,
                         bytesPerRow: bytesPerRow,
                         width: sourceWidth,
-                        height: sourceHeight
+                        height: sourceHeight,
+                        wetSurface: wetSurface,
+                        referenceGloss: style.finish == .gloss,
+                        imageToViewportTransform: imageToViewportTransform,
+                        mouthWidth: Float(max(contour.pose?.width ?? 1, 1)),
+                        profile: style.materialProfile
                     )
                 } else {
                     cameraSample = nil
@@ -740,14 +865,13 @@ final class LipTextureRenderer {
                 let pigmentVariation = Self.stableLipPigmentVariation(u: u, topV: topV)
                 let trustedCameraSample = cameraSample
                 let lipBase = trustedCameraSample?.base ?? Self.stableLipBaseColor(u: u, topV: topV)
-                let cosmeticCoverage = Self.cosmeticCoverage(
-                    maskAlpha: sample.alpha,
-                    outerDistance: sample.outerDistance,
-                    innerDistance: sample.innerDistance,
-                    finish: style.finish
-                )
+                let pigmentDistribution = style.finish == .tint ?
+                    Self.tintDistribution(
+                        outerDistance: sample.outerDistance,
+                        innerDistance: sample.innerDistance
+                    ) : 1
                 let baseAlpha = min(
-                    cosmeticCoverage *
+                    sample.alpha *
                     edgeNoise *
                     pigmentVariation.alpha,
                     1
@@ -769,7 +893,14 @@ final class LipTextureRenderer {
                     toneMap[mapIndex] = Self.cameraTone(
                         base: cameraSample.base,
                         blurred: cameraSample.blurred,
-                        highlightSurround: cameraSample.highlightSurround
+                        highlightSurround: cameraSample.highlightSurround,
+                        highlightConfidence: usesCameraHighlight ?
+                            cameraSample.highlightConfidence : 1,
+                        highlightThreshold: usesCameraHighlight ?
+                            style.materialProfile.cameraHighlightThreshold : 1,
+                        finish: style.finish,
+                        microTextureRetention:
+                            style.materialProfile.microTextureRetention
                     )
                     let cameraLuminance = Self.luminance(cameraSample.blurred)
                     cameraLumaSum += cameraLuminance
@@ -779,6 +910,7 @@ final class LipTextureRenderer {
                 let shineGeometry = sampler.shineGeometry(u: u, topV: topV)
                 materialInputs[mapIndex] = PixelMaterialInput(
                     alpha: alpha,
+                    pigmentDistribution: pigmentDistribution,
                     recessShade: sample.recessShade,
                     lipBase: lipBase,
                     highlightSurround:
@@ -788,7 +920,8 @@ final class LipTextureRenderer {
                     normalizedLipX: shineGeometry.normalizedX,
                     lowerLipMembership: shineGeometry.lowerLipMembership,
                     outerDistance: sample.outerDistance,
-                    innerDistance: sample.innerDistance
+                    innerDistance: sample.innerDistance,
+                    opticalSurface: wetSurface
                 )
             }
         }
@@ -797,6 +930,8 @@ final class LipTextureRenderer {
         let stabilizedToneMap = temporallyStabilizedToneMap(
             toneMap,
             activePixels: activeTonePixels,
+            finish: style.finish,
+            materialProfile: style.materialProfile,
             pixelWidth: pixelWidth,
             pixelHeight: pixelHeight,
             color: style.color,
@@ -805,6 +940,10 @@ final class LipTextureRenderer {
             lowLatency: lowLatency,
             motionDelta: motionDelta
         )
+        let shimmerYawRadians = viewYawDegrees.isFinite ?
+            Float(min(max(viewYawDegrees, 0), 65) * .pi / 180) : 0
+        let shimmerPitchRadians = viewPitchDegrees.isFinite ?
+            Float(min(max(viewPitchDegrees, 0), 65) * .pi / 180) : 0
         for mapIndex in materialInputs.indices {
             guard let input = materialInputs[mapIndex] else {
                 continue
@@ -813,7 +952,7 @@ final class LipTextureRenderer {
             guard effectiveAlpha > 0.006 else {
                 continue
             }
-            let baseMaterialRGB = Self.materialColor(
+            let appearance = Self.materialAppearance(
                 pigment: input.pigment,
                 base: input.lipBase,
                 highlightSurround: input.highlightSurround,
@@ -823,27 +962,67 @@ final class LipTextureRenderer {
                 lowerLipMembership: input.lowerLipMembership,
                 outerDistance: input.outerDistance,
                 innerDistance: input.innerDistance,
+                opticalSurface: input.opticalSurface,
+                cameraDetailCoherence: style.finish == .gloss ? 1 :
+                    max(0.18, 1 - Float(max(0, min(motionDelta / 0.22, 1))) * 0.82),
+                apertureClosure: Float(1 - sampler.innerApertureVisibility),
                 finish: style.finish,
                 materialProfile: style.materialProfile,
                 shadingDebugMode: style.shadingDebugMode
             )
-            let materialRGB = RGBColor(
-                red: baseMaterialRGB.red * input.recessShade,
-                green: baseMaterialRGB.green * input.recessShade,
-                blue: baseMaterialRGB.blue * input.recessShade
+            let pigmentCoverage = style.shadingDebugMode == .capturedShape ? 1 :
+                style.materialProfile.pigmentCoverage * input.pigmentDistribution
+            let reflectionCoverage = appearance.reflectionCoverage
+            highlightMotionMask?[mapIndex] = reflectionCoverage
+            let baseCoverage = reflectionCoverage +
+                pigmentCoverage * (1 - reflectionCoverage)
+            // The reflected layer is over the pigment. Its premultiplied
+            // contribution does not contain the pigment density. Apply the
+            // common lip mask after combining the two material layers.
+            let basePremultiplied = RGBColor(
+                red: appearance.reflection.red * reflectionCoverage +
+                    appearance.pigment.red * pigmentCoverage * (1 - reflectionCoverage),
+                green: appearance.reflection.green * reflectionCoverage +
+                    appearance.pigment.green * pigmentCoverage * (1 - reflectionCoverage),
+                blue: appearance.reflection.blue * reflectionCoverage +
+                    appearance.pigment.blue * pigmentCoverage * (1 - reflectionCoverage)
             )
-            let materialOpacity = style.materialProfile.pigmentCoverage /
-                LipstickDensity.high.pigmentCoverage
-            let outputAlpha = effectiveAlpha * (
-                style.shadingDebugMode == .capturedShape ? 1 : materialOpacity
+            var materialCoverage = baseCoverage
+            var materialPremultiplied = basePremultiplied
+            if style.finish == .shimmer && style.shadingDebugMode == .off {
+                let layer = Self.shimmerLayer(
+                    materialLuminance: Self.luminance(appearance.pigment),
+                    reflectionCoverage: reflectionCoverage,
+                    u: (Float(mapIndex % pixelWidth) + 0.5) / Float(pixelWidth),
+                    v: (Float(mapIndex / pixelWidth) + 0.5) / Float(pixelHeight),
+                    viewYawRadians: shimmerYawRadians,
+                    viewPitchRadians: shimmerPitchRadians,
+                    intensity: style.materialProfile.shimmerIntensity,
+                    sampler: sampler,
+                    pixelWidth: pixelWidth,
+                    pixelHeight: pixelHeight
+                )
+                materialCoverage = layer.coverage +
+                    baseCoverage * (1 - layer.coverage)
+                materialPremultiplied = RGBColor(
+                    red: layer.color.red * layer.coverage +
+                        basePremultiplied.red * (1 - layer.coverage),
+                    green: layer.color.green * layer.coverage +
+                        basePremultiplied.green * (1 - layer.coverage),
+                    blue: layer.color.blue * layer.coverage +
+                        basePremultiplied.blue * (1 - layer.coverage)
+                )
+            }
+            let outputAlpha = effectiveAlpha * materialCoverage
+            let materialColor = RGBColor(
+                red: materialPremultiplied.red / max(materialCoverage, 0.0001),
+                green: materialPremultiplied.green / max(materialCoverage, 0.0001),
+                blue: materialPremultiplied.blue / max(materialCoverage, 0.0001)
             )
-            // SceneKit performs the same ordinary alpha blend as Banuba for
-            // every finish. Density therefore reveals the camera naturally
-            // instead of being cancelled by inverse-alpha compensation.
             let linearPremultipliedColor = RGBColor(
-                red: materialRGB.red * outputAlpha,
-                green: materialRGB.green * outputAlpha,
-                blue: materialRGB.blue * outputAlpha
+                red: materialColor.red * outputAlpha * input.recessShade,
+                green: materialColor.green * outputAlpha * input.recessShade,
+                blue: materialColor.blue * outputAlpha * input.recessShade
             )
             let storedColor = Self.sRGBPremultipliedColor(
                 fromLinearPremultiplied: linearPremultipliedColor,
@@ -879,6 +1058,14 @@ final class LipTextureRenderer {
             rgba = fallback.rgba
             usedFallback = true
             fallbackPaintedPixels = fallback.paintedPixels
+        }
+        if let highlightMotionMask {
+            LipHighlightMotionDiagnostics.record(
+                usedFallback ? [Float](repeating: 0, count: highlightMotionMask.count) :
+                    highlightMotionMask,
+                width: pixelWidth, height: pixelHeight,
+                finish: style.finish, source: "cpu", at: CACurrentMediaTime()
+            )
         }
         let innerFeatherPaintedPixels = Self.fillInnerSamplingFeather(
             &rgba,
@@ -921,15 +1108,25 @@ final class LipTextureRenderer {
 
         let texture = LipTexture(image: UIImage(cgImage: cgImage, scale: renderScale, orientation: .up))
         return addingLinerMask(
-            to: texture,
+            to: LipTexture(image: texture.image,
+                linerColorImage: linerStyle.isEnabled ? makeCPULinerColorImage(
+                    contour: contour, sampler: sampler,
+                    imageSize: imageSize, viewportSize: viewportSize,
+                    pixelWidth: pixelWidth, pixelHeight: pixelHeight,
+                    renderScale: renderScale, style: linerStyle,
+                    baseAddress: baseAddress, bytesPerRow: bytesPerRow,
+                    sourceWidth: sourceWidth, sourceHeight: sourceHeight) : nil),
             contour: contour,
-            renderScale: renderScale
+            renderScale: renderScale,
+            enabled: linerStyle.isEnabled
         )
     }
 
     private func addingLinerMask(to texture: LipTexture,
                                  contour: LipContour,
-                                 renderScale: CGFloat) -> LipTexture {
+                                 renderScale: CGFloat,
+                                 enabled: Bool) -> LipTexture {
+        guard enabled, texture.linerColorImage != nil else { return texture }
         guard let cgImage = texture.image.cgImage else {
             return texture
         }
@@ -967,185 +1164,445 @@ final class LipTextureRenderer {
         return LipTexture(
             image: texture.image,
             opacityImage: texture.opacityImage,
+            linerColorImage: texture.linerColorImage,
             linerOpacityImage: linerOpacityImage
         )
     }
 
-    /// Builds a narrow cosmetic stroke through the detected vermilion points.
-    /// Cubic tangents remove polygon corners without shifting the landmarks;
-    /// clipped low-opacity passes add a small inward-only blend.
+    private func makeCPULinerColorImage(
+        contour: LipContour,
+        sampler: CanonicalLipSampler,
+        imageSize: CGSize,
+        viewportSize: CGSize,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        renderScale: CGFloat,
+        style: LinerRenderStyle,
+        baseAddress: UnsafeMutableRawPointer?,
+        bytesPerRow: Int,
+        sourceWidth: Int,
+        sourceHeight: Int
+    ) -> UIImage? {
+        guard let baseAddress else { return nil }
+        let inverse = Self.aspectFillTransform(for: imageSize,
+            in: viewportSize).inverted()
+        let cameraSampler = CanonicalLipSampler(contour: contour,
+            excludesInnerMouth: true, expandsCameraCarrier: true)
+        let expandedScreen = LipOuterBoundary.expandedScreenPoints(
+            contour: contour,
+            distance: LipOuterMargin.sampling(for: contour.pose?.width ?? 0)
+        ) ?? [:]
+        let sourcePoints = CanonicalLipGeometry.outerLipIndices.enumerated().compactMap {
+            offset, index -> CGPoint? in
+            guard contour.outer.indices.contains(offset) else { return nil }
+            return (expandedScreen[index] ?? contour.outer[offset]).applying(inverse)
+        }
+        let xs = sourcePoints.map(\.x)
+        let ys = sourcePoints.map(\.y)
+        let radiusX = min(max(((xs.max() ?? 0) - (xs.min() ?? 0)) * 0.012, 2), 10)
+        let radiusY = min(max(((ys.max() ?? 0) - (ys.min() ?? 0)) * 0.032, 2), 10)
+
+        func tone(at point: CGPoint) -> (Float, Float, Float, RGBColor)? {
+            let imagePoint = point.applying(inverse)
+            func color(_ offset: CGPoint) -> RGBColor? {
+                guard let sampled = Self.samplePixel(
+                    at: CGPoint(x: imagePoint.x + offset.x,
+                                y: imagePoint.y + offset.y),
+                    baseAddress: baseAddress, bytesPerRow: bytesPerRow,
+                    width: sourceWidth, height: sourceHeight) else { return nil }
+                return Self.sRGBToLinear(sampled)
+            }
+            guard let center = color(.zero) else { return nil }
+            let neighbors = [CGPoint(x: radiusX, y: 0),
+                CGPoint(x: -radiusX, y: 0),
+                CGPoint(x: 0, y: radiusY),
+                CGPoint(x: 0, y: -radiusY)]
+            let adjacent = neighbors.map { color($0) ?? center }
+            let lowColor = RGBColor(
+                red: (center.red + adjacent.reduce(Float(0)) { $0 + $1.red }) / 5,
+                green: (center.green + adjacent.reduce(Float(0)) { $0 + $1.green }) / 5,
+                blue: (center.blue + adjacent.reduce(Float(0)) { $0 + $1.blue }) / 5
+            )
+            let residual = RGBColor(red: max(center.red - lowColor.red, 0),
+                green: max(center.green - lowColor.green, 0),
+                blue: max(center.blue - lowColor.blue, 0))
+            let highest = max(residual.red, max(residual.green, residual.blue))
+            let lowest = min(residual.red, min(residual.green, residual.blue))
+            let neutral = Self.smoothStep(
+                (lowest / max(highest, 0.0001) - 0.25) / 0.40)
+            return (max(Self.luminance(center), 0.0031),
+                max(Self.luminance(lowColor), 0.0031), neutral, center)
+        }
+
+        var references: [Float] = []
+        for topV in [CGFloat(0.24), 0.30, 0.70, 0.76] {
+            for u in [CGFloat(0.24), 0.38, 0.50, 0.62, 0.76] {
+                if let sample = sampler.sample(u: u, topV: topV),
+                   sample.alpha > 0.8,
+                   let measured = tone(at: sample.point) {
+                    references.append(measured.1)
+                }
+            }
+        }
+        references.sort()
+        let measuredReference = references.count >= 8 ?
+            references[Int(Float(references.count - 1) * 0.65)] : nil
+        let now = CACurrentMediaTime()
+        temporalTextureLock.lock()
+        let reference: Float
+        if let measuredReference, measuredReference.isFinite,
+           measuredReference > 0.0045 {
+            if let previous = previousLinerReferenceLuma,
+               let timestamp = previousLinerReferenceTime {
+                let elapsed = max(0, min(now - timestamp, 0.25))
+                let stops = abs(log2(measuredReference / max(previous, 0.0045)))
+                let response: Double = stops > 0.70 ? 8 : 3
+                let weight = Float(1 - exp(-elapsed * response))
+                reference = previous + (measuredReference - previous) * weight
+            } else {
+                reference = measuredReference
+            }
+            previousLinerReferenceLuma = reference
+            previousLinerReferenceTime = now
+        } else {
+            reference = previousLinerReferenceLuma ?? 0
+        }
+        temporalTextureLock.unlock()
+
+        let pigment = Self.sRGBToLinear(style.color)
+        let pigmentY = Self.luminance(pigment)
+        let pale = Self.smoothStep((pigmentY - 0.16) / 0.22)
+        let lightLimit = style.profile.maximumLightStops * (1 - pale) +
+            min(style.profile.maximumLightStops, 0.38) * pale
+        var rgba = [UInt8](repeating: 255, count: pixelWidth * pixelHeight * 4)
+        for y in 0..<pixelHeight {
+            for x in 0..<pixelWidth {
+                let u = (CGFloat(x) + 0.5) / CGFloat(pixelWidth)
+                let v = (CGFloat(y) + 0.5) / CGFloat(pixelHeight)
+                let source = cameraSampler?.screenPoint(u: u, topV: v)
+                var shaded = pigment
+                if let source, let measured = tone(at: source) {
+                    let cameraAwarePigment = Self.banubaBaseColor(
+                        cameraLinear: measured.3,
+                        pigmentLinear: pigment,
+                        showsValueDebug: false
+                    )
+                    let localReference = reference > 0.0045 ? reference : measured.1
+                    let low = min(max(measured.1, localReference * 0.58),
+                        localReference * 1.55)
+                    let exposure = min(max(log2(low / max(localReference, 0.0045)),
+                        -style.profile.maximumShadowStops), lightLimit)
+                    let response = exposure < 0 ? style.profile.shadowRetention :
+                        style.profile.diffuseLightResponse
+                    let detail = min(max(log2(measured.0 / low), -0.24), 0.18)
+                    let factor = pow(Float(2), exposure * response +
+                        detail * style.profile.detailStrength)
+                    shaded = RGBColor(
+                        red: Self.clamp01(cameraAwarePigment.red * factor),
+                        green: Self.clamp01(cameraAwarePigment.green * factor),
+                        blue: Self.clamp01(cameraAwarePigment.blue * factor)
+                    )
+                    if style.profile.realHighlightStrength > 0 {
+                        let observed = Self.smoothStep(
+                            (measured.0 - low - 0.03) / 0.13) * measured.2
+                        let shine = Self.clamp01(
+                            observed * style.profile.realHighlightStrength)
+                        shaded = RGBColor(
+                            red: shaded.red + (1 - shaded.red) * shine,
+                            green: shaded.green + (1 - shaded.green) * shine,
+                            blue: shaded.blue + (1 - shaded.blue) * shine
+                        )
+                    }
+                }
+                let srgb = Self.linearToSRGB(shaded)
+                let offset = (y * pixelWidth + x) * 4
+                rgba[offset] = UInt8((Self.clamp01(srgb.red) * 255).rounded())
+                rgba[offset + 1] = UInt8((Self.clamp01(srgb.green) * 255).rounded())
+                rgba[offset + 2] = UInt8((Self.clamp01(srgb.blue) * 255).rounded())
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let image = CGImage(width: pixelWidth, height: pixelHeight,
+                bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: pixelWidth * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ??
+                    CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent) else { return nil }
+        return UIImage(cgImage: image, scale: renderScale, orientation: .up)
+    }
+
+    private enum LinerMaskProfile {
+        static let inwardFeatherPixelsAt112: CGFloat = 20
+        static let outwardEdgePixelsAt112: CGFloat = 0.8
+        static let lowerInwardFeatherPixelsAt112: CGFloat = 9
+        static let lowerOutwardEdgePixelsAt112: CGFloat = 2.4
+        static let lowerReferenceOutsetPixelsAt112: CGFloat = 2.6
+        static let cornerFadePixelsAt112: CGFloat = 14
+        // Density remains in LipMeshRenderer's material opacity and UI slider.
+    }
+
+    private static let linerSamplesPerSegment = 8
+
+    /// One detected outer reference, with independent inward and outward alpha falloffs.
     private static func makeLinerOpacityImage(contour: LipContour,
                                               pixelWidth: Int,
                                               pixelHeight: Int,
                                               renderScale: CGFloat) -> UIImage? {
-        guard contour.outerUV.count >= 4,
-              pixelWidth > 1,
-              pixelHeight > 1 else {
+        guard let outerSamples = linerReferencePixels(
+                contour: contour, pixelWidth: pixelWidth, pixelHeight: pixelHeight
+              ),
+              let innerSamples = sampleLinerBoundary(
+                contour.innerUV, pixelWidth: pixelWidth, pixelHeight: pixelHeight
+              ) else {
             return nil
         }
 
-        let outerPoints = contour.outerUV.map {
-            CGPoint(
-                x: $0.x * CGFloat(pixelWidth),
-                y: (1 - $0.y) * CGFloat(pixelHeight)
-            )
-        }
-        let innerCenter: CGPoint
-        if contour.innerUV.isEmpty {
-            innerCenter = CGPoint(
-                x: (outerPoints[0].x + outerPoints[outerPoints.count / 2].x) * 0.5,
-                y: (outerPoints[0].y + outerPoints[outerPoints.count / 2].y) * 0.5
-            )
-        } else {
-            let innerSum = contour.innerUV.reduce(CGPoint.zero) { sum, point in
-                CGPoint(x: sum.x + point.x, y: sum.y + point.y)
+        let outerPath = CGMutablePath()
+        outerPath.addLines(between: outerSamples)
+        outerPath.closeSubpath()
+        let innerPath = CGMutablePath()
+        innerPath.addLines(between: innerSamples)
+        innerPath.closeSubpath()
+
+        typealias Segment = (start: CGPoint, dx: CGFloat, dy: CGFloat,
+                             lengthSquared: CGFloat, arcStart: CGFloat)
+        func segments(for samples: [CGPoint]) -> [Segment] {
+            var result = [Segment]()
+            result.reserveCapacity(samples.count - 1)
+            var arcLength: CGFloat = 0
+            for (first, second) in zip(samples, samples.dropFirst()) {
+                let dx = second.x - first.x
+                let dy = second.y - first.y
+                let lengthSquared = dx * dx + dy * dy
+                guard lengthSquared > 0.000_001 else { continue }
+                result.append((first, dx, dy, lengthSquared, arcLength))
+                arcLength += sqrt(lengthSquared)
             }
-            let innerCount = CGFloat(contour.innerUV.count)
-            innerCenter = CGPoint(
-                x: innerSum.x / innerCount * CGFloat(pixelWidth),
-                y: (1 - innerSum.y / innerCount) * CGFloat(pixelHeight)
-            )
+            return result
         }
-        let halfCount = outerPoints.count / 2
-        let points = outerPoints.enumerated().map { index, point in
-            let sectionPosition: CGFloat
-            let maximumInset: CGFloat
-            if index <= halfCount {
-                sectionPosition = CGFloat(index) / CGFloat(halfCount)
-                maximumInset = 1.6 * CGFloat(pixelHeight) / 112
-            } else {
-                sectionPosition = CGFloat(index - halfCount) / CGFloat(halfCount)
-                // Pull the upper pencil edge onto the lip so its soft outer
-                // half no longer enlarges the upper-lip silhouette.
-                maximumInset = 3.8 * CGFloat(pixelHeight) / 112
+        func closestPoint(from point: CGPoint,
+                          on segments: [Segment]) -> (distanceSquared: CGFloat,
+                                                     arcLength: CGFloat) {
+            var nearest = CGFloat.infinity
+            var nearestArc: CGFloat = 0
+            for segment in segments {
+                let t = min(max(((point.x - segment.start.x) * segment.dx +
+                                 (point.y - segment.start.y) * segment.dy) /
+                                segment.lengthSquared, 0), 1)
+                let dx = point.x - segment.start.x - t * segment.dx
+                let dy = point.y - segment.start.y - t * segment.dy
+                let distanceSquared = dx * dx + dy * dy
+                if distanceSquared < nearest {
+                    nearest = distanceSquared
+                    nearestArc = segment.arcStart + t * sqrt(segment.lengthSquared)
+                }
             }
-            let sectionWeight = sin(sectionPosition * .pi)
-            let dx = innerCenter.x - point.x
-            let dy = innerCenter.y - point.y
-            let distance = max(hypot(dx, dy), 0.001)
-            let inset = maximumInset * sectionWeight
-            return CGPoint(
-                x: point.x + dx / distance * inset,
-                y: point.y + dy / distance * inset
-            )
+            return (nearest, nearestArc)
+        }
+        let outerSegments = segments(for: outerSamples)
+        let innerSegments = segments(for: innerSamples)
+        guard let lastOuterSegment = outerSegments.last,
+              !innerSegments.isEmpty else { return nil }
+
+        let scale = CGFloat(pixelHeight) / 112
+        let inwardFeather = LinerMaskProfile.inwardFeatherPixelsAt112 * scale
+        let outwardEdge = LinerMaskProfile.outwardEdgePixelsAt112 * scale
+        let lowerInwardFeather =
+            LinerMaskProfile.lowerInwardFeatherPixelsAt112 * scale
+        let lowerOutwardEdge =
+            LinerMaskProfile.lowerOutwardEdgePixelsAt112 * scale
+        let maximumOutwardEdge = max(outwardEdge, lowerOutwardEdge)
+        let cornerFadeDistance = LinerMaskProfile.cornerFadePixelsAt112 * scale
+        let rightCornerArc = outerSegments
+            .prefix(10 * linerSamplesPerSegment)
+            .reduce(CGFloat.zero) { $0 + sqrt($1.lengthSquared) }
+        let totalArc = lastOuterSegment.arcStart +
+            sqrt(lastOuterSegment.lengthSquared)
+        let xValues = outerSamples.map(\.x)
+        let yValues = outerSamples.map(\.y)
+        let minX = max(Int(floor((xValues.min() ?? 0) - maximumOutwardEdge - 1)), 0)
+        let maxX = min(Int(ceil((xValues.max() ?? 0) + maximumOutwardEdge + 1)), pixelWidth - 1)
+        let minY = max(Int(floor((yValues.min() ?? 0) - maximumOutwardEdge - 1)), 0)
+        let maxY = min(Int(ceil((yValues.max() ?? 0) + maximumOutwardEdge + 1)), pixelHeight - 1)
+        guard minX <= maxX, minY <= maxY else { return nil }
+
+        func smoothStep(_ value: CGFloat) -> CGFloat {
+            let t = min(max(value, 0), 1)
+            return t * t * (3 - 2 * t)
         }
 
-        func smoothPath(through pathPoints: [CGPoint]) -> CGPath {
-            let path = CGMutablePath()
-            path.move(to: pathPoints[0])
-            let tangentScale: CGFloat = 0.68 / 6
-            for index in pathPoints.indices {
-                let previous = pathPoints[
-                    (index - 1 + pathPoints.count) % pathPoints.count
-                ]
-                let current = pathPoints[index]
-                let next = pathPoints[(index + 1) % pathPoints.count]
-                let afterNext = pathPoints[(index + 2) % pathPoints.count]
-                path.addCurve(
-                    to: next,
-                    control1: CGPoint(
-                        x: current.x + (next.x - previous.x) * tangentScale,
-                        y: current.y + (next.y - previous.y) * tangentScale
-                    ),
-                    control2: CGPoint(
-                        x: next.x - (afterNext.x - current.x) * tangentScale,
-                        y: next.y - (afterNext.y - current.y) * tangentScale
-                    )
+        var rgba = [UInt8](repeating: 0, count: pixelWidth * pixelHeight * 4)
+        for y in minY...maxY {
+            for x in minX...maxX {
+                let point = CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)
+                let outer = closestPoint(from: point, on: outerSegments)
+                let inside = outerPath.contains(point)
+                let lowerCornerDistance = min(
+                    outer.arcLength, rightCornerArc - outer.arcLength)
+                let lowerWeight = outer.arcLength <= rightCornerArc &&
+                    rightCornerArc > 0 ? smoothStep(
+                        lowerCornerDistance / cornerFadeDistance) : 0
+                let currentInwardFeather = inwardFeather +
+                    (lowerInwardFeather - inwardFeather) * lowerWeight
+                let currentOutwardEdge = outwardEdge +
+                    (lowerOutwardEdge - outwardEdge) * lowerWeight
+                let innerEdgeFade = currentInwardFeather * 0.25
+                let featherWidth = inside ?
+                    currentInwardFeather : currentOutwardEdge
+                guard outer.distanceSquared.isFinite,
+                      outer.distanceSquared < featherWidth * featherWidth,
+                      !innerPath.contains(point) else {
+                    continue
+                }
+
+                let inner = closestPoint(from: point, on: innerSegments)
+                guard inner.distanceSquared.isFinite else { continue }
+                let edgeFade = smoothStep(
+                    sqrt(inner.distanceSquared) / innerEdgeFade
+                )
+                let contourFade = 1 - smoothStep(
+                    sqrt(outer.distanceSquared) / featherWidth
+                )
+                let distanceToCorner = min(
+                    min(outer.arcLength,
+                        abs(outer.arcLength - rightCornerArc)),
+                    totalArc - outer.arcLength
+                )
+                let cornerFade = smoothStep(distanceToCorner / cornerFadeDistance)
+                let alpha = edgeFade * contourFade * cornerFade
+                let byte = UInt8((alpha * 255).rounded())
+                let offset = (y * pixelWidth + x) * 4
+                rgba[offset] = byte
+                rgba[offset + 1] = byte
+                rgba[offset + 2] = byte
+                rgba[offset + 3] = byte
+            }
+        }
+
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let image = CGImage(
+                width: pixelWidth, height: pixelHeight,
+                bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: pixelWidth * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue:
+                    CGImageAlphaInfo.premultipliedLast.rawValue)
+                    .union(.byteOrder32Big),
+                provider: provider, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else {
+            return nil
+        }
+        return UIImage(cgImage: image, scale: renderScale, orientation: .up)
+    }
+
+    // The DEBUG overlay samples the upper part of this same full contour.
+    static func upperLinerReferencePixels(contour: LipContour,
+                                          pixelWidth: Int,
+                                          pixelHeight: Int) -> [CGPoint]? {
+        guard let allSamples = linerReferencePixels(
+            contour: contour, pixelWidth: pixelWidth, pixelHeight: pixelHeight
+        ) else {
+            return nil
+        }
+        let first = 10 * linerSamplesPerSegment
+        return Array(allSamples[first...])
+    }
+
+    private static func linerReferencePixels(contour: LipContour,
+                                             pixelWidth: Int,
+                                             pixelHeight: Int) -> [CGPoint]? {
+        guard var samples = sampleLinerBoundary(contour.outerUV,
+                pixelWidth: pixelWidth, pixelHeight: pixelHeight) else {
+            return nil
+        }
+        let lowerSampleCount = 10 * linerSamplesPerSegment
+        guard samples.count > lowerSampleCount + 1 else { return nil }
+        let scale = CGFloat(pixelHeight) / 112
+        let outset = LinerMaskProfile.lowerReferenceOutsetPixelsAt112 * scale
+        let outwardSign: CGFloat = samples[0].x >=
+            samples[lowerSampleCount].x ? 1 : -1
+        let original = samples
+        for offset in 1..<lowerSampleCount {
+            let tangent = CGPoint(
+                x: original[offset + 1].x - original[offset - 1].x,
+                y: original[offset + 1].y - original[offset - 1].y)
+            let length = hypot(tangent.x, tangent.y)
+            guard length > 0.0001 else { continue }
+            let cornerDistance = min(offset, lowerSampleCount - offset)
+            let fade = min(CGFloat(cornerDistance) /
+                CGFloat(2 * linerSamplesPerSegment), 1)
+            let weight = fade * fade * (3 - 2 * fade)
+            samples[offset] = CGPoint(
+                x: original[offset].x +
+                    tangent.y / length * outwardSign * outset * weight,
+                y: original[offset].y -
+                    tangent.x / length * outwardSign * outset * weight
+            )
+        }
+        return samples
+    }
+
+    private static func sampleLinerBoundary(_ boundaryUV: [CGPoint],
+                                            pixelWidth: Int,
+                                            pixelHeight: Int) -> [CGPoint]? {
+        guard boundaryUV.count == 20,
+              pixelWidth > 1, pixelHeight > 1 else { return nil }
+        let points = boundaryUV.map {
+            CGPoint(x: $0.x * CGFloat(pixelWidth),
+                    y: (1 - $0.y) * CGFloat(pixelHeight))
+        }
+        guard points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
+            return nil
+        }
+
+        let tangentScale: CGFloat = 0.88 / 6
+        var samples = [CGPoint]()
+        samples.reserveCapacity(points.count * linerSamplesPerSegment + 1)
+        for index in points.indices {
+            let previous = points[(index - 1 + points.count) % points.count]
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            let afterNext = points[(index + 2) % points.count]
+            let chord = hypot(next.x - current.x, next.y - current.y)
+            let limit = chord * 0.22
+            func control(from endpoint: CGPoint, toward candidate: CGPoint) -> CGPoint {
+                let dx = candidate.x - endpoint.x
+                let dy = candidate.y - endpoint.y
+                let length = hypot(dx, dy)
+                let fraction = length > limit && length > 0 ? limit / length : 1
+                return CGPoint(
+                    x: min(max(endpoint.x + dx * fraction,
+                               min(current.x, next.x)), max(current.x, next.x)),
+                    y: min(max(endpoint.y + dy * fraction,
+                               min(current.y, next.y)), max(current.y, next.y))
                 )
             }
-            path.closeSubpath()
-            return path
-        }
-        let path = smoothPath(through: points)
-        let lipClipPath = smoothPath(through: outerPoints)
-        let cornerOffsets = [0, points.count / 2]
-        let mouthCenter = CGPoint(
-            x: (points[cornerOffsets[0]].x + points[cornerOffsets[1]].x) * 0.5,
-            y: (points[cornerOffsets[0]].y + points[cornerOffsets[1]].y) * 0.5
-        )
-        let cornerFadeGradient = CGGradient(
-            colorsSpace: CGColorSpaceCreateDeviceRGB(),
-            colors: [
-                UIColor.white.withAlphaComponent(0.6).cgColor,
-                UIColor.white.withAlphaComponent(0.3).cgColor,
-                UIColor.white.withAlphaComponent(0).cgColor
-            ] as CFArray,
-            locations: [0, 0.52, 1]
-        )
-
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(
-            size: CGSize(width: pixelWidth, height: pixelHeight),
-            format: format
-        )
-        let image = renderer.image { context in
-            let cgContext = context.cgContext
-            cgContext.setLineCap(.round)
-            cgContext.setLineJoin(.round)
-
-            // Clip the faint passes to the lip shape. Their nested widths make
-            // the inner pencil edge dissolve progressively into the lip.
-            cgContext.saveGState()
-            cgContext.addPath(lipClipPath)
-            cgContext.clip()
-            cgContext.addPath(path)
-            cgContext.setStrokeColor(UIColor.white.withAlphaComponent(0.06).cgColor)
-            cgContext.setLineWidth(40.0 * CGFloat(pixelHeight) / 112)
-            cgContext.strokePath()
-            cgContext.addPath(path)
-            cgContext.setStrokeColor(UIColor.white.withAlphaComponent(0.3).cgColor)
-            cgContext.setLineWidth(28.0 * CGFloat(pixelHeight) / 112)
-            cgContext.strokePath()
-            cgContext.addPath(path)
-            cgContext.setStrokeColor(UIColor.white.withAlphaComponent(0.6).cgColor)
-            cgContext.setLineWidth(17.0 * CGFloat(pixelHeight) / 112)
-            cgContext.strokePath()
-            cgContext.restoreGState()
-
-            cgContext.addPath(path)
-            cgContext.setStrokeColor(UIColor.white.withAlphaComponent(0.7).cgColor)
-            cgContext.setLineWidth(10.0 * CGFloat(pixelHeight) / 112)
-            cgContext.strokePath()
-
-            cgContext.addPath(path)
-            cgContext.setStrokeColor(UIColor.white.withAlphaComponent(0.7).cgColor)
-            cgContext.setLineWidth(6.0 * CGFloat(pixelHeight) / 112)
-            cgContext.strokePath()
-
-            // Reduce the completed mask around both mouth corners. Applying
-            // this last makes the core and every inward feather fade together.
-            if let cornerFadeGradient {
-                cgContext.saveGState()
-                cgContext.setBlendMode(.destinationOut)
-                let cornerRadius = 12.5 * CGFloat(pixelHeight) / 112
-                for offset in cornerOffsets {
-                    let corner = points[offset]
-                    let fadeCenter = CGPoint(
-                        x: corner.x + (mouthCenter.x - corner.x) * 0.06,
-                        y: corner.y + (mouthCenter.y - corner.y) * 0.06
-                    )
-                    cgContext.drawRadialGradient(
-                        cornerFadeGradient,
-                        startCenter: fadeCenter,
-                        startRadius: 0,
-                        endCenter: fadeCenter,
-                        endRadius: cornerRadius,
-                        options: []
-                    )
-                }
-                cgContext.restoreGState()
+            let first = control(from: current, toward: CGPoint(
+                x: current.x + (next.x - previous.x) * tangentScale,
+                y: current.y + (next.y - previous.y) * tangentScale
+            ))
+            let second = control(from: next, toward: CGPoint(
+                x: next.x - (afterNext.x - current.x) * tangentScale,
+                y: next.y - (afterNext.y - current.y) * tangentScale
+            ))
+            for step in 0..<linerSamplesPerSegment {
+                let t = CGFloat(step) / CGFloat(linerSamplesPerSegment)
+                let complement = 1 - t
+                let firstWeight = 3 * complement * complement * t
+                let secondWeight = 3 * complement * t * t
+                samples.append(CGPoint(
+                    x: complement * complement * complement * current.x +
+                        firstWeight * first.x + secondWeight * second.x + t * t * t * next.x,
+                    y: complement * complement * complement * current.y +
+                        firstWeight * first.y + secondWeight * second.y + t * t * t * next.y
+                ))
             }
         }
-        guard let linerCGImage = image.cgImage else {
-            return nil
-        }
-        return UIImage(
-            cgImage: linerCGImage,
-            scale: renderScale,
-            orientation: .up
-        )
+        samples.append(points[0])
+        return samples
     }
 
     private func makeStableProceduralTexture(sampler: CanonicalLipSampler,
@@ -1482,7 +1939,7 @@ final class LipTextureRenderer {
         )
     }
 
-    private static func materialColor(pigment: RGBColor,
+    private static func materialAppearance(pigment: RGBColor,
                                       base: RGBColor,
                                       highlightSurround: RGBColor,
                                       signals: CameraMaterialSignals,
@@ -1491,22 +1948,103 @@ final class LipTextureRenderer {
                                       lowerLipMembership: Float,
                                       outerDistance: CGFloat,
                                       innerDistance: CGFloat,
+                                      opticalSurface: LipOpticalSurface.Sample?,
+                                      cameraDetailCoherence: Float,
+                                      apertureClosure: Float,
                                       finish: LipFinish,
                                       materialProfile: LipMaterialProfile,
-                                      shadingDebugMode: LipShadingDebugMode) -> RGBColor {
+                                      shadingDebugMode: LipShadingDebugMode) -> MaterialAppearance {
         var cameraAwarePigment = banubaBaseColor(
             cameraLinear: base,
             pigmentLinear: pigment,
             showsValueDebug: shadingDebugMode == .capturedShape
         )
         if shadingDebugMode == .capturedShape {
-            return cameraAwarePigment
+            return MaterialAppearance(
+                pigment: cameraAwarePigment,
+                reflection: cameraAwarePigment,
+                reflectionCoverage: 0
+            )
+        }
+        if finish == .satin {
+            let cameraSRGB = linearToSRGB(base)
+            let pigmentSRGB = linearToSRGB(pigment)
+            let cameraValue = max(cameraSRGB.red,
+                                  max(cameraSRGB.green, cameraSRGB.blue))
+            let lipstickValue = max(pigmentSRGB.red,
+                                    max(pigmentSRGB.green, pigmentSRGB.blue))
+            let rawTargetValue = cameraValue * lipstickValue / 0.85
+            if rawTargetValue > 0.82 {
+                let targetValue = 0.82 + 0.13 *
+                    (1 - exp(-(rawTargetValue - 0.82) / 0.13))
+                let pigmentHS = hsvHueAndSaturation(pigmentSRGB)
+                cameraAwarePigment = sRGBToLinear(hsvColor(
+                    hue: pigmentHS.hue,
+                    saturation: pigmentHS.saturation,
+                    value: targetValue
+                ))
+            }
+        }
+        if finish == .gloss || finish == .oil || finish == .satin {
+            let isWet = finish == .gloss || finish == .oil
+            let distanceSum = max(Float(outerDistance + innerDistance), 0.0001)
+            let surfacePosition = Float(innerDistance) / distanceSum
+            let boundaryGate = finish == .gloss ?
+                smoothStep((surfacePosition - 0.12) / 0.18) *
+                    (1 - smoothStep((surfacePosition - 0.80) / 0.18)) :
+                smoothStep((surfacePosition - 0.025) / 0.135) *
+                    (1 - smoothStep((surfacePosition - 0.84) / 0.145))
+            let observed = signals.shineMask
+            let wetMask = smoothStep((observed - materialProfile.shineMaskMinimum) /
+                max(materialProfile.shineMaskMaximum - materialProfile.shineMaskMinimum, 0.001))
+            if isWet {
+                let baseSRGB = linearToSRGB(base)
+                let surroundSRGB = linearToSRGB(highlightSurround)
+                let cameraValue = max(baseSRGB.red,
+                                      max(baseSRGB.green, baseSRGB.blue))
+                let surroundValue = max(surroundSRGB.red,
+                                        max(surroundSRGB.green, surroundSRGB.blue))
+                let diffuseValue = cameraValue +
+                    (min(cameraValue, surroundValue) - cameraValue) * wetMask * 0.82
+                cameraAwarePigment = banubaBaseColor(
+                    cameraValue: diffuseValue,
+                    pigmentLinear: pigment,
+                    showsValueDebug: false
+                )
+            }
+            let exponent = materialProfile.cameraHighlightExponent *
+                materialProfile.highlightConcentration /
+                max(materialProfile.cameraRoughnessTuning, 0.35)
+            let light = min(pow(wetMask, max(exponent, 0.001)) *
+                materialProfile.cameraHighlightGain *
+                materialProfile.capturedHighlightStrength * cameraDetailCoherence,
+                materialProfile.capturedHighlightMaximum)
+            let arc = opticalSurface?.arc ?? normalizedLipX
+            let across = opticalSurface?.across ?? (1 - surfacePosition)
+            let corner = smoothStep((abs(arc - 0.5) * 2 - 0.62) / 0.34)
+            let innerEdge = smoothStep((across - 0.78) / 0.20)
+            let seamSuppression: Float = isWet ?
+                0.30 + 0.28 * apertureClosure :
+                0.74 + 0.18 * apertureClosure
+            let guardedLight = light * boundaryGate *
+                (1 - corner * 0.82) * (1 - innerEdge * seamSuppression) *
+                (finish == .gloss ? lowerLipMembership : 1)
+            let layer = reflectionLayer(cameraAwarePigment,
+                                        amount: guardedLight,
+                                        highlightMaximum: materialProfile.capturedHighlightMaximum,
+                                        finish: finish)
+            return MaterialAppearance(
+                pigment: cameraAwarePigment,
+                reflection: layer.color,
+                reflectionCoverage: layer.coverage
+            )
         }
 
         let cornerPosition = min(abs(normalizedLipX - 0.5) * 2, 1)
         let cornerRegion = smoothStep((cornerPosition - 0.62) / 0.34)
         let innerSeamRegion = 1 - smoothStep((abs(Float(topV) - 0.50) - 0.018) / 0.085)
-        let finishedPigment: RGBColor
+        var reflectionCoverage: Float = 0
+        var reflection = RGBColor(red: 1, green: 1, blue: 1)
         if finish == .matte || finish == .satin || finish.isWet {
             // Preserve the camera reflection footprint. Finish-specific
             // response changes only its visibility and brightness; it never
@@ -1526,7 +2064,7 @@ final class LipTextureRenderer {
             let lowerFadeOutStart: Float
             let lowerFadeOutEnd: Float
             switch finish {
-            case .gloss:
+            case .gloss, .shimmer:
                 outerFadeStart = 0.58
                 outerFadeEnd = 0.70
                 lowerFadeInStart = 0.24
@@ -1633,47 +2171,76 @@ final class LipTextureRenderer {
                     materialProfile.capturedHighlightMaximum
                 )
             }
-            finishedPigment = colorByApplyingShine(
+            (reflection, reflectionCoverage) = reflectionLayer(
                 cameraAwarePigment,
                 amount: highlightAmount,
+                highlightMaximum: materialProfile.capturedHighlightMaximum,
                 finish: finish
             )
-        } else {
-            finishedPigment = cameraAwarePigment
         }
-        return finishedPigment
+        return MaterialAppearance(
+            pigment: cameraAwarePigment,
+            reflection: reflection,
+            reflectionCoverage: reflectionCoverage
+        )
     }
 
-    /// Wet finishes receive a white specular reflection; satin and subtle
-    /// matte shine use a softer HSV response and retain the product colour.
-    private static func colorByApplyingShine(
+    /// The mask controls reflection coverage independently of pigment alpha.
+    /// Satin keeps the product hue in its softer reflected colour.
+    private static func reflectionLayer(
         _ linearColor: RGBColor,
         amount: Float,
+        highlightMaximum: Float,
         finish: LipFinish
-    ) -> RGBColor {
+    ) -> (color: RGBColor, coverage: Float) {
+        if finish == .gloss || finish == .oil {
+            return (RGBColor(red: 1, green: 1, blue: 1),
+                    finish == .gloss ? clamp01(amount * 1.45) :
+                        1 - exp(-max(amount, 0)))
+        }
         if finish.isWet {
-            let whiteAmount = clamp01(
+            let coverage = clamp01(
                 amount * (finish == .oil ? 2.30 : 1.45)
             )
-            return RGBColor(
-                red: linearColor.red + (1 - linearColor.red) * whiteAmount,
-                green: linearColor.green + (1 - linearColor.green) * whiteAmount,
-                blue: linearColor.blue + (1 - linearColor.blue) * whiteAmount
-            )
+            return (RGBColor(red: 1, green: 1, blue: 1), coverage)
         }
 
         let colorSRGB = linearToSRGB(linearColor)
         let hueAndSaturation = hsvHueAndSaturation(colorSRGB)
         let value = max(colorSRGB.red, max(colorSRGB.green, colorSRGB.blue))
-        let visibleShine = clamp01(
-            amount * (finish == .matte ? 1.30 : 1.40)
-        )
-        return sRGBToLinear(hsvColor(
+        let coverage = finish == .satin ?
+            1 - exp(-max(amount, 0) *
+                (1 + smoothStep((value - 0.55) / 0.30))) :
+            clamp01(amount * (finish == .matte ? 1.30 : 1.40))
+        guard coverage > 0.0001 else {
+            return (linearColor, 0)
+        }
+        let satinTarget = sRGBToLinear(hsvColor(
             hue: hueAndSaturation.hue,
             saturation: hueAndSaturation.saturation *
-                (1 - visibleShine * 0.22),
-            value: value + (1 - value) * visibleShine
+                (1 - coverage * 0.22),
+            value: value + (1 - value) * coverage
         ))
+        // Choose the reflected colour so full pigment coverage retains the
+        // previous soft satin response. Only the shine coverage is inverted.
+        let softReflection = RGBColor(
+            red: clamp01((satinTarget.red - linearColor.red * (1 - coverage)) / coverage),
+            green: clamp01((satinTarget.green - linearColor.green * (1 - coverage)) / coverage),
+            blue: clamp01((satinTarget.blue - linearColor.blue * (1 - coverage)) / coverage)
+        )
+        guard finish == .satin else {
+            return (softReflection, coverage)
+        }
+        // A narrow white core follows only the strongest observed highlights.
+        let normalizedShine = amount / max(highlightMaximum, 0.001)
+        let whiteCore = 0.92 * smoothStep((normalizedShine - 0.60) / 0.35)
+        let combinedCoverage = whiteCore + coverage * (1 - whiteCore)
+        let softWeight = coverage * (1 - whiteCore)
+        return (RGBColor(
+            red: (whiteCore + softReflection.red * softWeight) / combinedCoverage,
+            green: (whiteCore + softReflection.green * softWeight) / combinedCoverage,
+            blue: (whiteCore + softReflection.blue * softWeight) / combinedCoverage
+        ), combinedCoverage)
     }
 
     /// Adapts Banuba beauty-ios `matt.frag` as the diffuse base for every
@@ -1860,7 +2427,11 @@ final class LipTextureRenderer {
 
     private static func cameraTone(base: RGBColor,
                                    blurred: RGBColor,
-                                   highlightSurround: RGBColor) -> CameraMaterialSignals {
+                                   highlightSurround: RGBColor,
+                                   highlightConfidence: Float,
+                                   highlightThreshold: Float,
+                                   finish: LipFinish,
+                                   microTextureRetention: Float) -> CameraMaterialSignals {
         let baseLuma = luminance(base)
         let blurredLuma = max(luminance(blurred), 0.0045)
         let highlightSurroundLuma = max(
@@ -1875,7 +2446,8 @@ final class LipTextureRenderer {
             max(baseLuma, 0.0031) / highlightSurroundLuma
         ) * 0.45
         let relativeHighlight = smoothStep(
-            (highlightLogContrast - 0.001) / 0.064
+            (highlightLogContrast - 0.001 * highlightThreshold) /
+                max(0.064 * highlightThreshold, 0.0001)
         )
         let highlightBrightness = smoothStep(
             (baseLuma - 0.012) / 0.208
@@ -1897,33 +2469,15 @@ final class LipTextureRenderer {
         let illuminantEvidence = smoothStep(
             (residualBalance - 0.18) / 0.44
         )
+        let neutralEvidence = 0.30 + illuminantEvidence * 0.70
+        let colorEvidence = finish == .satin ?
+            max(neutralEvidence, clamp01(microTextureRetention)) :
+            neutralEvidence
         return CameraMaterialSignals(
             detail: detail,
             lowFrequencyLuminance: blurredLuma,
             shineMask: relativeHighlight * highlightBrightness *
-                (0.30 + illuminantEvidence * 0.70)
-        )
-    }
-
-    private static func cosmeticCoverage(maskAlpha: Float,
-                                         outerDistance: CGFloat,
-                                         innerDistance: CGFloat,
-                                         finish: LipFinish) -> Float {
-        let innerDistance = Float(innerDistance)
-        // The shared mask already includes the wet-line density roll-off.
-        let finishDistribution = finish == .tint ?
-            Self.tintDistribution(
-                outerDistance: outerDistance,
-                innerDistance: CGFloat(innerDistance)
-            ) : 1
-        // Build corrective colour against the high-density reference. The
-        // selected product density is applied afterwards to premultiplied RGB
-        // and alpha together, so lower density genuinely reveals the real lip
-        // instead of being cancelled out by colour compensation.
-        return clamp01(
-            maskAlpha *
-                finishDistribution *
-                LipstickDensity.high.pigmentCoverage
+                colorEvidence * highlightConfidence
         )
     }
 
@@ -2095,7 +2649,12 @@ final class LipTextureRenderer {
                                         baseAddress: UnsafeMutableRawPointer,
                                         bytesPerRow: Int,
                                         width: Int,
-                                        height: Int) -> CameraLipSample? {
+                                        height: Int,
+                                        wetSurface: LipOpticalSurface.Sample?,
+                                        referenceGloss: Bool,
+                                        imageToViewportTransform: CGAffineTransform,
+                                        mouthWidth: Float,
+                                        profile: LipMaterialProfile) -> CameraLipSample? {
         let imagePoint = point.applying(inverseImageTransform)
         guard let baseSRGB = samplePixel(
             at: imagePoint,
@@ -2147,7 +2706,8 @@ final class LipTextureRenderer {
             return CameraLipSample(
                 base: base,
                 blurred: base,
-                highlightSurround: base
+                highlightSurround: base,
+                highlightConfidence: 0
             )
         }
 
@@ -2188,17 +2748,74 @@ final class LipTextureRenderer {
             green: green / count,
             blue: blue / count
         )
-        let highlightSurround = highlightCount > 0 ?
+        var highlightSurround = highlightCount > 0 ?
             RGBColor(
                 red: highlightRed / highlightCount,
                 green: highlightGreen / highlightCount,
                 blue: highlightBlue / highlightCount
             ) : blurred
+        var highlightConfidence: Float = 1
+        if wetSurface != nil || referenceGloss {
+            let sampleScale = profile.cameraSampleScale *
+                profile.cameraHighlightSize
+            let offsets = [
+                CGPoint(x: -CGFloat(12 * sampleScale), y: 0),
+                CGPoint(x: CGFloat(12 * sampleScale), y: 0),
+                CGPoint(x: 0, y: -CGFloat(8 * sampleScale)),
+                CGPoint(x: 0, y: CGFloat(8 * sampleScale))
+            ]
+            var sum = RGBColor(red: 0, green: 0, blue: 0)
+            var validWeight: Float = 0
+            for offset in offsets {
+                let viewportDelta = SIMD2<Float>(
+                    Float(imageToViewportTransform.a * offset.x +
+                          imageToViewportTransform.c * offset.y),
+                    Float(imageToViewportTransform.b * offset.x +
+                          imageToViewportTransform.d * offset.y)
+                )
+                let geometryWeight: Float
+                if let wetSurface, !referenceGloss {
+                    let across = wetSurface.across +
+                        simd_dot(viewportDelta, wetSurface.transverse) /
+                        max(wetSurface.thickness, 1)
+                    let cornerClearance = min(wetSurface.arc,
+                        1 - wetSurface.arc) * mouthWidth -
+                        simd_length(viewportDelta)
+                    geometryWeight = smoothStep((across - 0.02) / 0.08) *
+                        (1 - smoothStep((across - 0.90) / 0.08)) *
+                        smoothStep(cornerClearance / 6)
+                } else {
+                    geometryWeight = 1
+                }
+                guard geometryWeight > 0.001,
+                    let pixel = samplePixel(
+                    at: CGPoint(x: imagePoint.x + offset.x,
+                                y: imagePoint.y + offset.y),
+                    baseAddress: baseAddress,
+                    bytesPerRow: bytesPerRow,
+                    width: width,
+                    height: height
+                ) else { continue }
+                let linear = sRGBToLinear(pixel)
+                let weight = referenceGloss ? 1 :
+                    geometryWeight * (1 - toothProbability(pixel))
+                sum = RGBColor(red: sum.red + linear.red * weight,
+                               green: sum.green + linear.green * weight,
+                               blue: sum.blue + linear.blue * weight)
+                validWeight += weight
+            }
+            highlightSurround = validWeight > 0.001 ?
+                RGBColor(red: sum.red / validWeight,
+                         green: sum.green / validWeight,
+                         blue: sum.blue / validWeight) : base
+            highlightConfidence = smoothStep((validWeight - 0.5) / 1.3)
+        }
 
         return CameraLipSample(
             base: base,
             blurred: blurred,
-            highlightSurround: highlightSurround
+            highlightSurround: highlightSurround,
+            highlightConfidence: highlightConfidence
         )
     }
 
@@ -2259,6 +2876,115 @@ final class LipTextureRenderer {
         return (max(0.975, min(alpha, 1.008)), color)
     }
 
+    private static func shimmerHash(x: UInt32, y: UInt32) -> UInt32 {
+        var hash = (x &* 0x8da6b343) ^ (y &* 0xd8163841)
+        hash ^= hash >> 16
+        hash = hash &* 0x7feb352d
+        hash ^= hash >> 15
+        hash = hash &* 0x846ca68b
+        return hash ^ (hash >> 16)
+    }
+
+    private static func shimmerNoise(u: Float, v: Float) -> Float {
+        let gridX = u * 96
+        let gridY = v * 48
+        let cellX = UInt32(floor(gridX))
+        let cellY = UInt32(floor(gridY))
+        let fractionX = gridX - floor(gridX)
+        let fractionY = gridY - floor(gridY)
+        let weightX = fractionX * fractionX * (3 - 2 * fractionX)
+        let weightY = fractionY * fractionY * (3 - 2 * fractionY)
+        let first = Float(shimmerHash(x: cellX, y: cellY) & 1023) / 1023
+        let second = Float(shimmerHash(x: cellX + 1, y: cellY) & 1023) / 1023
+        let third = Float(shimmerHash(x: cellX, y: cellY + 1) & 1023) / 1023
+        let fourth = Float(shimmerHash(x: cellX + 1, y: cellY + 1) & 1023) / 1023
+        let upper = first + (second - first) * weightX
+        let lower = third + (fourth - third) * weightX
+        return upper + (lower - upper) * weightY
+    }
+
+    private static func shimmerLayer(materialLuminance: Float,
+                                      reflectionCoverage: Float,
+                                      u: Float, v: Float,
+                                      viewYawRadians: Float,
+                                      viewPitchRadians: Float,
+                                      intensity: Float,
+                                      sampler: CanonicalLipSampler,
+                                      pixelWidth: Int,
+                                      pixelHeight: Int) -> ShimmerLayer {
+        let grain = shimmerNoise(u: u, v: v)
+        var light = smoothStep((materialLuminance - 0.025) / 0.195)
+        let shapeLight = smoothStep((reflectionCoverage - 0.02) / 0.20)
+        light = max(light, 0.45 * shapeLight)
+        let angle = smoothStep((viewYawRadians + viewPitchRadians * 0.6) / 0.7)
+        let colourShift = clamp01(0.45 + (grain - 0.5) * 0.55 +
+            0.24 * sin(viewYawRadians * 2.2 + viewPitchRadians * 1.3))
+        let pearlColour = mixColor(
+            RGBColor(red: 1, green: 0.76, blue: 0.68),
+            RGBColor(red: 0.79, green: 0.77, blue: 1),
+            amount: colourShift
+        )
+        let pearlCoverage = clamp01((0.05 + 0.13 * shapeLight) * light *
+            (0.45 + 0.55 * grain) * (0.78 + 0.22 * angle) *
+            min(max(intensity, 0), 4))
+
+        let gridX = u * 96
+        let gridY = v * 48
+        let particleHash = shimmerHash(
+            x: UInt32(floor(gridX)), y: UInt32(floor(gridY))
+        )
+        guard particleHash % 8 == 0 else {
+            return ShimmerLayer(color: pearlColour, coverage: pearlCoverage)
+        }
+        let bright = (particleHash >> 11) % 11 == 0
+        let dx = gridX - floor(gridX) - 0.5
+        let dy = gridY - floor(gridY) - 0.5
+        let radius = sqrt(dx * dx + dy * dy)
+        let start: Float = bright ? 0.25 : 0.15
+        let end: Float = bright ? 0.62 : 0.70
+        let particle = 1 - smoothStep((radius - start) / (end - start))
+        let reflectedLight = (0.35 + 0.65 * light) *
+            (0.70 + 0.30 * shapeLight) * (0.85 + 0.15 * angle)
+        let particleStrength = min(
+            particle * (bright ? 1.60 : 0.65) * reflectedLight *
+                min(max(intensity / 3, 0), 1.33),
+            0.92
+        ) * sampler.shimmerParticleInnerGate(
+            u: CGFloat(u), topV: CGFloat(v),
+            pixelWidth: pixelWidth, pixelHeight: pixelHeight
+        )
+        let particleColour: RGBColor
+        switch (particleHash >> 16) & 3 {
+        case 0:
+            particleColour = RGBColor(red: 1, green: 0.86, blue: 0.72)
+        case 1:
+            particleColour = RGBColor(red: 1, green: 0.78, blue: 0.90)
+        case 2:
+            particleColour = RGBColor(red: 0.85, green: 0.80, blue: 1)
+        default:
+            particleColour = RGBColor(red: 0.78, green: 0.92, blue: 1)
+        }
+        let reflectionColour = bright ? mixColor(
+            particleColour,
+            RGBColor(red: 1, green: 1, blue: 1),
+            amount: 0.55
+        ) : particleColour
+        let coverage = particleStrength +
+            pearlCoverage * (1 - particleStrength)
+        guard coverage > 0.0001 else {
+            return ShimmerLayer(color: pearlColour, coverage: 0)
+        }
+        let pearlWeight = pearlCoverage * (1 - particleStrength)
+        return ShimmerLayer(color: RGBColor(
+            red: (reflectionColour.red * particleStrength +
+                pearlColour.red * pearlWeight) / coverage,
+            green: (reflectionColour.green * particleStrength +
+                pearlColour.green * pearlWeight) / coverage,
+            blue: (reflectionColour.blue * particleStrength +
+                pearlColour.blue * pearlWeight) / coverage
+        ), coverage: coverage)
+    }
+
     private static func stableWave(u: CGFloat,
                                    topV: CGFloat,
                                    ux: Double,
@@ -2277,6 +3003,16 @@ final class LipTextureRenderer {
         let luminance = sRGB.red * 0.299 + sRGB.green * 0.587 + sRGB.blue * 0.114
         let saturation = maxChannel > 0.001 ? (maxChannel - minChannel) / maxChannel : 0
         return luminance > 0.64 && saturation < 0.22
+    }
+
+    private static func toothProbability(_ sRGB: RGBColor) -> Float {
+        let maximum = max(sRGB.red, max(sRGB.green, sRGB.blue))
+        let minimum = min(sRGB.red, min(sRGB.green, sRGB.blue))
+        let saturation = maximum > 0.001 ? (maximum - minimum) / maximum : 0
+        let perceptualLuma = sRGB.red * 0.299 + sRGB.green * 0.587 +
+            sRGB.blue * 0.114
+        return smoothStep((perceptualLuma - 0.64) / 0.18) *
+            (1 - smoothStep((saturation - 0.16) / 0.14))
     }
 
     private static func makeAlphaMask(contour: LipContour,
@@ -2449,6 +3185,8 @@ final class LipTextureRenderer {
 
     private func temporallyStabilizedToneMap(_ toneMap: [CameraMaterialSignals],
                                              activePixels: [Bool],
+                                             finish: LipFinish,
+                                             materialProfile: LipMaterialProfile,
                                              pixelWidth: Int,
                                              pixelHeight: Int,
                                              color: RGBColor,
@@ -2468,6 +3206,7 @@ final class LipTextureRenderer {
         let topologyChanged = previousToneMouthOpen.map { $0 != excludesInnerMouth } ?? false
         let shouldReset =
             previousToneMap == nil ||
+            previousShineConfidence?.count != toneMap.count ||
             previousToneMapWidth != pixelWidth ||
             previousToneMapHeight != pixelHeight ||
             previousToneMap?.count != toneMap.count ||
@@ -2477,6 +3216,13 @@ final class LipTextureRenderer {
 
         if shouldReset {
             previousToneMap = toneMap
+            let activationFloor = materialProfile.shineMaskMinimum +
+                max(materialProfile.shineMaskMaximum -
+                    materialProfile.shineMaskMinimum, 0.001) * 0.08
+            previousShineConfidence = toneMap.indices.map { index in
+                activePixels[index] && toneMap[index].shineMask > activationFloor ?
+                    1 : 0
+            }
             previousToneMapWidth = pixelWidth
             previousToneMapHeight = pixelHeight
             previousToneColor = color
@@ -2492,47 +3238,113 @@ final class LipTextureRenderer {
             return toneMap
         }
 
-        guard let previous = previousToneMap else {
+        guard let previous = previousToneMap,
+              let previousConfidence = previousShineConfidence else {
             return toneMap
         }
 
         var output = toneMap
+        var historyToneMap = toneMap
+        var confidenceMap = previousConfidence
         let normalizedMotion = Float(max(0, min(motionDelta / 0.22, 1)))
         let baseCurrentWeight: Float = lowLatency ? 0.60 : 0.22
         let currentWeight = min(lowLatency ? 0.72 : 0.38, baseCurrentWeight + normalizedMotion * 0.12)
+        let shineRange = max(materialProfile.shineMaskMaximum -
+            materialProfile.shineMaskMinimum, 0.001)
+        let activationFloor = materialProfile.shineMaskMinimum +
+            shineRange * 0.08
+        let activationFull = materialProfile.shineMaskMinimum +
+            shineRange * 0.18
+        let strongCore = materialProfile.shineMaskMinimum +
+            shineRange * 0.45
         for index in toneMap.indices {
             guard activePixels[index] else {
+                confidenceMap[index] = 0
                 continue
             }
 
-            let currentShine = toneMap[index].shineMask
-            let previousShine = previous[index].shineMask
-            let baseShineWeight: Float = currentShine < previousShine ?
-                0.90 : (lowLatency ? 0.86 : 0.78)
-            let shineCurrentWeight = min(
-                0.98,
-                max(baseShineWeight, currentWeight) + normalizedMotion * 0.08
+            let centerShine = toneMap[index].shineMask
+            let x = index % pixelWidth
+            let y = index / pixelWidth
+            let left = toneMap[x > 0 ? index - 1 : index].shineMask
+            let right = toneMap[x + 1 < pixelWidth ? index + 1 : index].shineMask
+            let above = toneMap[y > 0 ? index - pixelWidth : index].shineMask
+            let below = toneMap[y + 1 < pixelHeight ? index + pixelWidth : index].shineMask
+            // Feather only weak fringe pixels; keep the sampled bright core.
+            let crossAverage = (centerShine * 4 + left + right + above + below) * 0.125
+            let centerCoverage = Self.smoothStep(
+                (centerShine - materialProfile.shineMaskMinimum) / shineRange
             )
+            let spatialFringe = 1 - Self.smoothStep((centerCoverage - 0.05) / 0.35)
+            let currentShine = centerShine +
+                (crossAverage - centerShine) * spatialFringe * 0.45
+            let previousShine = previous[index].shineMask
+            let shineDelta = abs(currentShine - previousShine)
+            let smallHighlightChange = normalizedMotion < 0.35 &&
+                shineDelta < 0.12
+            let baseShineWeight: Float = currentShine < previousShine ?
+                0.90 : (finish == .gloss ? 1 :
+                    (lowLatency ? 0.86 : 0.78))
+            let responsiveWeight = smallHighlightChange ?
+                min(0.22 + 0.23 * Self.smoothStep(shineDelta / 0.12),
+                    max(baseShineWeight, currentWeight)) :
+                min(0.98,
+                    max(baseShineWeight, currentWeight) +
+                        normalizedMotion * 0.08)
+            let edgeSignal = Self.smoothStep(
+                (max(currentShine, previousShine) -
+                    materialProfile.shineMaskMinimum) / shineRange
+            )
+            let edge = 1 - Self.smoothStep((edgeSignal - 0.05) / 0.35)
+            var shineCurrentWeight = responsiveWeight +
+                (0.16 - responsiveWeight) * edge
+            if normalizedMotion < 0.35 &&
+                previousConfidence[index] > 0.5 &&
+                currentShine < previousShine {
+                shineCurrentWeight = min(shineCurrentWeight,
+                    previousShine >= strongCore ? 0.25 : 0.16)
+            }
             var stabilizedShine = Self.blendFloat(
                 previous: previousShine,
                 current: currentShine,
                 currentWeight: shineCurrentWeight
             )
-            if currentShine < 0.003, stabilizedShine < 0.035 {
-                stabilizedShine = 0
+            if currentShine < 0.003 {
+                stabilizedShine *= Self.smoothStep(
+                    (stabilizedShine - 0.002) / 0.033
+                )
             }
-            output[index] = CameraMaterialSignals(
-                detail: Self.blendFloat(previous: previous[index].detail, current: toneMap[index].detail, currentWeight: currentWeight),
-                lowFrequencyLuminance: Self.blendFloat(
-                    previous: previous[index].lowFrequencyLuminance,
-                    current: toneMap[index].lowFrequencyLuminance,
-                    currentWeight: currentWeight
-                ),
-                shineMask: stabilizedShine
+            let evidence = Self.smoothStep(
+                (currentShine - activationFloor) /
+                    max(activationFull - activationFloor, 0.001)
             )
+            let confidence: Float
+            if normalizedMotion < 0.35 {
+                let previousValue = previousConfidence[index]
+                confidence = previousValue + (evidence - previousValue) *
+                    (evidence > previousValue ? 0.36 :
+                        (previousShine >= strongCore ? 0.30 : 0.10))
+            } else {
+                confidence = currentShine > activationFloor ? 1 : 0
+            }
+            confidenceMap[index] = confidence
+            let visibility = Self.smoothStep((confidence - 0.35) / 0.40)
+            let detail = Self.blendFloat(previous: previous[index].detail,
+                current: toneMap[index].detail, currentWeight: currentWeight)
+            let luminance = Self.blendFloat(
+                previous: previous[index].lowFrequencyLuminance,
+                current: toneMap[index].lowFrequencyLuminance,
+                currentWeight: currentWeight)
+            historyToneMap[index] = CameraMaterialSignals(
+                detail: detail, lowFrequencyLuminance: luminance,
+                shineMask: stabilizedShine)
+            output[index] = CameraMaterialSignals(
+                detail: detail, lowFrequencyLuminance: luminance,
+                shineMask: stabilizedShine * visibility)
         }
 
-        previousToneMap = output
+        previousToneMap = historyToneMap
+        previousShineConfidence = confidenceMap
         previousToneMapWidth = pixelWidth
         previousToneMapHeight = pixelHeight
         previousToneColor = color

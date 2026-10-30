@@ -162,6 +162,8 @@ final class LipMeshRenderer {
     private let debugUpperNode = SCNNode()
     private let debugMeshNode = SCNNode()
     private let debugFrameNode = SCNNode()
+    private let debugTrackedUpperNode = SCNNode()
+    private let debugLinerReferenceNode = SCNNode()
     private let lipMaterial = SCNMaterial()
     private let linerMaterial = SCNMaterial()
     private let debugOuterMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemGreen)
@@ -169,10 +171,17 @@ final class LipMeshRenderer {
     private let debugUpperMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemRed)
     private let debugMeshMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemYellow.withAlphaComponent(0.82))
     private let debugFrameMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemPink)
+    private let debugTrackedUpperMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemCyan)
+    private let debugLinerReferenceMaterial = LipMeshRenderer.makeDebugMaterial(color: UIColor.systemOrange)
     private var occlusionNode: SCNNode?
     private var lastTextureImage: UIImage?
+    private var lastLinerColorImage: UIImage?
     private var lastLinerOpacityImage: UIImage?
     private let debugLinesEnabled = false
+    #if DEBUG
+    // Toggle from LLDB: LipMeshRenderer.debugLinerAlignmentEnabled = true
+    static var debugLinerAlignmentEnabled = false
+    #endif
     private var lastLightingFactor: CGFloat = 1
     private var openMouthGeometryCache: DynamicSurfaceGeometryCache?
     private var screenSpaceGeometryCache: DynamicSurfaceGeometryCache?
@@ -201,11 +210,15 @@ final class LipMeshRenderer {
         debugUpperNode.name = "lipstick.debug.upper"
         debugMeshNode.name = "lipstick.debug.mesh"
         debugFrameNode.name = "lipstick.debug.frame"
+        debugTrackedUpperNode.name = "lipstick.debug.trackedUpper"
+        debugLinerReferenceNode.name = "lipstick.debug.linerReference"
         debugRootNode.addChildNode(debugMeshNode)
         debugRootNode.addChildNode(debugOuterNode)
         debugRootNode.addChildNode(debugInnerNode)
         debugRootNode.addChildNode(debugUpperNode)
         debugRootNode.addChildNode(debugFrameNode)
+        debugRootNode.addChildNode(debugTrackedUpperNode)
+        debugRootNode.addChildNode(debugLinerReferenceNode)
 
         lipMaterial.lightingModel = .constant
         lipMaterial.blendMode = .alpha
@@ -241,12 +254,6 @@ final class LipMeshRenderer {
         linerMaterial.isDoubleSided = true
         linerMaterial.writesToDepthBuffer = false
         linerMaterial.readsFromDepthBuffer = false
-        linerMaterial.diffuse.contents = UIColor(
-            red: 0.47,
-            green: 0.16,
-            blue: 0.19,
-            alpha: 1
-        )
         linerMaterial.diffuse.textureComponents = [.red, .green, .blue]
         linerMaterial.transparent.textureComponents = .alpha
         for property in [linerMaterial.diffuse, linerMaterial.transparent] {
@@ -275,8 +282,7 @@ final class LipMeshRenderer {
         clearLip()
     }
 
-    func updateLiner(color: UIColor, opacity: Double) {
-        linerMaterial.diffuse.contents = color.withAlphaComponent(1)
+    func updateLiner(opacity: Double) {
         requestedLinerOpacity = CGFloat(max(0, min(opacity, 1)))
         applyEffectiveOpacity()
     }
@@ -376,6 +382,11 @@ final class LipMeshRenderer {
             linerMaterial.transparent.contents = texture.linerOpacityImage
             lastLinerOpacityImage = texture.linerOpacityImage
         }
+        if lastLinerColorImage !== texture.linerColorImage {
+            linerMaterial.diffuse.contents = texture.linerColorImage
+            lastLinerColorImage = texture.linerColorImage
+        }
+        applyEffectiveOpacity()
         lipMaterial.readsFromDepthBuffer = false
         lipNode.geometry = geometry
         lipNode.isHidden = false
@@ -452,6 +463,11 @@ final class LipMeshRenderer {
             linerMaterial.transparent.contents = texture.linerOpacityImage
             lastLinerOpacityImage = texture.linerOpacityImage
         }
+        if lastLinerColorImage !== texture.linerColorImage {
+            linerMaterial.diffuse.contents = texture.linerColorImage
+            lastLinerColorImage = texture.linerColorImage
+        }
+        applyEffectiveOpacity()
         lipNode.geometry = geometry
         lipNode.isHidden = false
         if isRecovering {
@@ -467,7 +483,16 @@ final class LipMeshRenderer {
             interval: 0.75,
             "lip_mesh alignment=screen_space_2d age=\(Self.fmt(CGFloat(contourAge))) motion=\(Self.fmt(motionDelta)) visible=\(!lipNode.isHidden) mask=\(Self.fmt(maskVisibility)) opacity=\(Self.fmt(lipMaterial.transparency)) bounds=(\(Self.fmt(CGFloat(bounds.max.x - bounds.min.x)))x\(Self.fmt(CGFloat(bounds.max.y - bounds.min.y)))x\(Self.fmt(CGFloat(bounds.max.z - bounds.min.z))))"
         )
+        #if DEBUG
+        if Self.debugLinerAlignmentEnabled {
+            updateLinerAlignmentDebug(contour: contour, texture: texture,
+                                      renderer: renderer, sceneRoot: sceneRoot)
+        } else {
+            clearDebugLines()
+        }
+        #else
         clearDebugLines()
+        #endif
     }
 
     func renderUnavailable() {
@@ -512,9 +537,11 @@ final class LipMeshRenderer {
         clearLip()
         lastTextureImage = nil
         lastLinerOpacityImage = nil
+        lastLinerColorImage = nil
         lipMaterial.diffuse.contents = nil
         lipMaterial.transparent.contents = nil
         linerMaterial.transparent.contents = nil
+        linerMaterial.diffuse.contents = nil
     }
 
     private func updateMaskVisibility(
@@ -546,7 +573,12 @@ final class LipMeshRenderer {
 
     private func applyEffectiveOpacity() {
         lipMaterial.transparency = requestedOpacity * maskVisibility
-        linerMaterial.transparency = requestedLinerOpacity * maskVisibility
+        let hasLinerTexture = lastLinerColorImage != nil &&
+            lastLinerOpacityImage != nil
+        linerMaterial.transparency = hasLinerTexture ?
+            requestedLinerOpacity *
+                CGFloat(LinerMaterialProfile.wax.pigmentDensity) *
+                maskVisibility : 0
     }
 
     private static func makeDebugMaterial(color: UIColor) -> SCNMaterial {
@@ -1053,8 +1085,98 @@ final class LipMeshRenderer {
         debugUpperNode.geometry = nil
         debugMeshNode.geometry = nil
         debugFrameNode.geometry = nil
+        debugTrackedUpperNode.geometry = nil
+        debugLinerReferenceNode.geometry = nil
         debugRootNode.isHidden = true
     }
+
+    #if DEBUG
+    private func updateLinerAlignmentDebug(contour: LipContour,
+                                            texture: LipTexture,
+                                            renderer: SCNSceneRenderer,
+                                            sceneRoot: SCNNode) {
+        guard let image = texture.image.cgImage,
+              let samples = LipTextureRenderer.upperLinerReferencePixels(
+                contour: contour, pixelWidth: image.width,
+                pixelHeight: image.height
+              ) else {
+            clearDebugLines()
+            return
+        }
+        let mesh = makeMediaPipeLipMesh(contour: contour,
+                                        expandsOuterFeatherBoundary: true)
+        guard !mesh.vertices.isEmpty else { clearDebugLines(); return }
+
+        func screenPoint(for uv: CGPoint) -> CGPoint? {
+            for offset in stride(from: 0, to: mesh.indices.count, by: 3) {
+                let a = mesh.vertices[Int(mesh.indices[offset])]
+                let b = mesh.vertices[Int(mesh.indices[offset + 1])]
+                let c = mesh.vertices[Int(mesh.indices[offset + 2])]
+                let denominator = (b.uv.y - c.uv.y) * (a.uv.x - c.uv.x) +
+                    (c.uv.x - b.uv.x) * (a.uv.y - c.uv.y)
+                guard abs(denominator) > 0.000_000_1 else { continue }
+                let first = ((b.uv.y - c.uv.y) * (uv.x - c.uv.x) +
+                             (c.uv.x - b.uv.x) * (uv.y - c.uv.y)) / denominator
+                let second = ((c.uv.y - a.uv.y) * (uv.x - c.uv.x) +
+                              (a.uv.x - c.uv.x) * (uv.y - c.uv.y)) / denominator
+                let third = 1 - first - second
+                guard first >= -0.000_01, second >= -0.000_01,
+                      third >= -0.000_01 else { continue }
+                return CGPoint(
+                    x: first * a.screen.x + second * b.screen.x + third * c.screen.x,
+                    y: first * a.screen.y + second * b.screen.y + third * c.screen.y
+                )
+            }
+            return nil
+        }
+
+        let tracked = (10...20).map { contour.outer[$0 % 20] }
+        let reference = samples.compactMap { point -> CGPoint? in
+            screenPoint(for: CGPoint(x: point.x / CGFloat(image.width),
+                                     y: 1 - point.y / CGFloat(image.height)))
+        }
+        guard reference.count == samples.count else { clearDebugLines(); return }
+        if debugRootNode.parent !== sceneRoot {
+            debugRootNode.removeFromParentNode()
+            debugRootNode.simdTransform = matrix_identity_float4x4
+            sceneRoot.addChildNode(debugRootNode)
+        }
+        func geometry(for points: [CGPoint], dashed: Bool,
+                      material: SCNMaterial) -> SCNGeometry? {
+            let vertices = points.map { point in
+                renderer.unprojectPoint(SCNVector3(
+                    Float(point.x), Float(point.y), Self.screenSpaceDepth * 0.8
+                ))
+            }
+            var indices = [Int32]()
+            for offset in 0..<(vertices.count - 1) where !dashed || offset % 4 < 2 {
+                indices.append(Int32(offset))
+                indices.append(Int32(offset + 1))
+            }
+            return lineGeometry(vertices: vertices, indices: indices,
+                                material: material)
+        }
+        debugTrackedUpperNode.geometry = geometry(
+            for: tracked, dashed: false, material: debugTrackedUpperMaterial
+        )
+        debugLinerReferenceNode.geometry = geometry(
+            for: reference, dashed: true, material: debugLinerReferenceMaterial
+        )
+        debugRootNode.isHidden = false
+
+        let errors = (10...20).compactMap { offset -> CGFloat? in
+            guard let projected = screenPoint(for: contour.outerUV[offset % 20]) else {
+                return nil
+            }
+            let original = contour.outer[offset % 20]
+            return hypot(projected.x - original.x, projected.y - original.y)
+        }
+        LipDebugLog.throttled(
+            "liner_alignment", interval: 0.75,
+            "liner_alignment mappedUpperMaxPx=\(Self.fmt(errors.max() ?? .infinity)) mapped=\(errors.count)/11 referenceSamples=\(reference.count)"
+        )
+    }
+    #endif
 
     private func lineLoopGeometry(indices: [Int],
                                   pointByIndex: [Int: SCNVector3],
@@ -1347,31 +1469,23 @@ final class LipMeshRenderer {
             expandedOuterScreenPoints = [:]
             expandedOuterUVPoints = [:]
         }
+        if expandsOuterFeatherBoundary {
+            let expected = CanonicalLipGeometry.outerLipIndices.count
+            guard expandedOuterScreenPoints.count == expected,
+                  expandedOuterUVPoints.count == expected else {
+                return ([], [])
+            }
+        }
 
         func meshVertex(for landmarkIndex: Int) -> MeshVertex? {
             guard let point = contour.meshPointsByIndex[landmarkIndex] else {
                 return nil
             }
-            let textureUV: CGPoint
-            let screenPoint: CGPoint
-            if expandsOuterFeatherBoundary,
-               CanonicalLipGeometry.isOuterLipIndex(landmarkIndex),
-               let expandedScreenPoint = expandedOuterScreenPoints[landmarkIndex],
-               let expandedUVPoint = expandedOuterUVPoints[landmarkIndex] {
-                textureUV = expandedUVPoint
-                screenPoint = expandedScreenPoint
-            } else if CanonicalLipGeometry.isInnerLipIndex(landmarkIndex) {
-                textureUV = point.uv
-                screenPoint = point.screen
-            } else {
-                textureUV = point.uv
-                screenPoint = point.screen
-            }
             return MeshVertex(
                 index: landmarkIndex,
-                screen: screenPoint,
+                screen: point.screen,
                 normalized: point.normalized,
-                uv: textureUV
+                uv: point.uv
             )
         }
 
@@ -1412,12 +1526,49 @@ final class LipMeshRenderer {
         let appendedFillTriangleCount = appendTriangleSet(
             CanonicalLipGeometry.innerFillTriangles
         )
+        if expandsOuterFeatherBoundary {
+            let outerIndices = CanonicalLipGeometry.outerLipIndices
+            for offset in outerIndices.indices {
+                let firstIndex = outerIndices[offset]
+                let secondIndex = outerIndices[(offset + 1) % outerIndices.count]
+                guard let first = meshVertex(for: firstIndex),
+                      let second = meshVertex(for: secondIndex),
+                      let firstScreen = expandedOuterScreenPoints[firstIndex],
+                      let secondScreen = expandedOuterScreenPoints[secondIndex],
+                      let firstUV = expandedOuterUVPoints[firstIndex],
+                      let secondUV = expandedOuterUVPoints[secondIndex] else {
+                    return ([], [])
+                }
+                // A second outer ring gives the feather room while the raw UV
+                // boundary remains a vertex at the tracked screen position.
+                let firstCarrier = MeshVertex(
+                    index: -firstIndex - 1,
+                    screen: firstScreen,
+                    normalized: first.normalized,
+                    uv: firstUV
+                )
+                let secondCarrier = MeshVertex(
+                    index: -secondIndex - 1,
+                    screen: secondScreen,
+                    normalized: second.normalized,
+                    uv: secondUV
+                )
+                indices.append(contentsOf: [
+                    appendOrReuse(first), appendOrReuse(second),
+                    appendOrReuse(firstCarrier),
+                    appendOrReuse(second), appendOrReuse(secondCarrier),
+                    appendOrReuse(firstCarrier)
+                ])
+            }
+        }
         let expectedTriangleCount =
             CanonicalLipGeometry.lipMeshTriangles.count +
-            CanonicalLipGeometry.innerFillTriangles.count
+            CanonicalLipGeometry.innerFillTriangles.count +
+            (expandsOuterFeatherBoundary ? CanonicalLipGeometry.outerLipIndices.count * 2 : 0)
         guard appendedSurfaceTriangleCount == CanonicalLipGeometry.lipMeshTriangles.count,
               appendedFillTriangleCount == CanonicalLipGeometry.innerFillTriangles.count,
-              vertices.count == CanonicalLipGeometry.attentionLipIndices.count,
+              vertices.count == CanonicalLipGeometry.attentionLipIndices.count +
+                (expandsOuterFeatherBoundary ? CanonicalLipGeometry.outerLipIndices.count : 0),
               indices.count == expectedTriangleCount * 3 else {
             return ([], [])
         }
